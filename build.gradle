@@ -433,8 +433,6 @@ task integTestJuno(type: RestIntegTestTask) {
     systemProperty "https", System.getProperty("https")
     systemProperty "user", System.getProperty("user")
     systemProperty "password", System.getProperty("password")
-    systemProperty "aws.accessKeyId", System.getProperty("aws.accessKeyId")
-    systemProperty "aws.secretKey", System.getProperty("aws.secretKey")
     systemProperty 'aws.service', System.getProperty('aws.service')
     systemProperty 'aws.region', System.getProperty('aws.region')
     systemProperty 'accountId', System.getProperty('accountId')

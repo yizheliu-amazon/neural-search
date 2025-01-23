@@ -62,8 +62,6 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
     private static final String SYS_PROPERTY_KEY_CLUSTER_ENDPOINT = "tests.rest.cluster";
     private static final String SYS_PROPERTY_KEY_USER = "user";
     private static final String SYS_PROPERTY_KEY_PASSWORD = "password";
-    private static final String SYS_PROPERTY_KEY_AWS_ACCESS_KEY_ID = "aws.accessKeyId";
-    private static final String SYS_PROPERTY_KEY_AWS_SECRET_ACCESS_KEY = "aws.secretKey";
     private static final String SYS_PROPERTY_KEY_AWS_SERVICE = "aws.service";
     private static final String SYS_PROPERTY_KEY_AWS_REGION = "aws.region";
     private static final String SYS_PROPERTY_KEY_ACCOUNT_ID = "accountId";
@@ -122,23 +120,16 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
                     throw new RuntimeException("AOSS collection info is missing. Check if accountId and collectionId are both provided.");
                 }
                 final Map<String, String> headers = ThreadContext.buildDefaultHeaders(settings);
-                headers.put("X-Amzn-Aoss-Account-Id", accountId);
-                headers.put("X-Amzn-Aoss-Collection-Id", collectionId);
-                final Header[] defaultHeaders = new Header[headers.size()];
+                final Header[] defaultHeaders = new Header[headers.size() + 2];
                 int i = 0;
                 for (Map.Entry<String, String> entry : headers.entrySet()) {
                     defaultHeaders[i++] = new BasicHeader(entry.getKey(), entry.getValue());
                 }
+                defaultHeaders[headers.size()] = new BasicHeader("X-Amzn-Aoss-Account-Id", accountId);
+                defaultHeaders[headers.size() + 1] = new BasicHeader("X-Amzn-Aoss-Collection-Id", collectionId);
                 builder.setDefaultHeaders(defaultHeaders);
 
                 builder.setHttpClientConfigCallback(httpClientBuilder -> {
-                    final String awsAccessKeyId = System.getProperty(SYS_PROPERTY_KEY_AWS_ACCESS_KEY_ID);
-                    final String awsSecretKey = System.getProperty(SYS_PROPERTY_KEY_AWS_SECRET_ACCESS_KEY);
-                    if (awsAccessKeyId.isEmpty() || awsSecretKey.isEmpty()) {
-                        throw new RuntimeException(
-                            "AWS credential is missing. Check if aws.AccessKeyId and aws.SecretKey are both provided."
-                        );
-                    }
                     HttpRequestInterceptor awsRequestSigningInterceptor = new AwsRequestSigningApacheInterceptor(
                         awsService,
                         AwsV4HttpSigner.create(),
