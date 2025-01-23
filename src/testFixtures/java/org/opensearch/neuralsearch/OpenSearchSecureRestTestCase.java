@@ -8,13 +8,7 @@ import org.apache.http.Header;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.ParseException;
-import org.apache.http.auth.AuthScope;
-import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.client.CredentialsProvider;
-import org.apache.http.conn.ssl.NoopHostnameVerifier;
-import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.message.BasicHeader;
-import org.apache.http.ssl.SSLContextBuilder;
 import static org.opensearch.knn.common.KNNConstants.MODEL_INDEX_NAME;
 import static org.opensearch.neuralsearch.util.TestUtils.NEURAL_SEARCH_BWC_PREFIX;
 import static org.opensearch.neuralsearch.util.TestUtils.OPENDISTRO_SECURITY;
@@ -30,10 +24,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.junit.After;
+import org.opensearch.client.JunoRestClient;
+import org.opensearch.client.JunoRestClientBuilder;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.RestClient;
-import org.opensearch.client.RestClientBuilder;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -97,19 +92,13 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
         return PROTOCOL_HTTPS;
     }
 
-    @Override
     protected RestClient buildClient(Settings settings, HttpHost[] hosts) throws IOException {
-        final RestClientBuilder builder = RestClient.builder(hosts);
-        if (PROTOCOL_HTTPS.equals(getProtocol())) {
-            configureHttpsClient(builder, settings);
-        } else {
-            configureClient(builder, settings);
-        }
-
+        final JunoRestClientBuilder builder = JunoRestClient.junoBuilder(hosts);
+        configureHttpsClient(builder, settings);
         return builder.build();
     }
 
-    private void configureHttpsClient(final RestClientBuilder builder, final Settings settings) {
+    private void configureHttpsClient(final JunoRestClientBuilder builder, final Settings settings) {
         if (System.getProperty(SYS_PROPERTY_KEY_AWS_SERVICE) != null) {
             final String awsService = System.getProperty(SYS_PROPERTY_KEY_AWS_SERVICE);
             if (awsService.equalsIgnoreCase("aoss")) {
@@ -146,29 +135,7 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
                 throw new IllegalArgumentException("Unrecognized AWS service name.");
             }
         } else {
-            final Map<String, String> headers = ThreadContext.buildDefaultHeaders(settings);
-            final Header[] defaultHeaders = new Header[headers.size()];
-            int i = 0;
-            for (Map.Entry<String, String> entry : headers.entrySet()) {
-                defaultHeaders[i++] = new BasicHeader(entry.getKey(), entry.getValue());
-            }
-            builder.setDefaultHeaders(defaultHeaders);
-            builder.setHttpClientConfigCallback(httpClientBuilder -> {
-                final String userName = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_USER))
-                    .orElseThrow(() -> new RuntimeException("user name is missing"));
-                final String password = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_PASSWORD))
-                    .orElseThrow(() -> new RuntimeException("password is missing"));
-                final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-                credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(userName, password));
-                try {
-                    return httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider)
-                        // disable the certificate since our testing cluster just uses the default security configuration
-                        .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
-                        .setSSLContext(SSLContextBuilder.create().loadTrustMaterial(null, (chains, authType) -> true).build());
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            });
+            throw new UnsupportedOperationException("Running non cloud native tests on juno cluster is not supported.");
         }
 
         final String socketTimeoutString = settings.get(CLIENT_SOCKET_TIMEOUT);
@@ -192,7 +159,7 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
 
     @After
     public void deleteExternalIndices() throws IOException, ParseException {
-        final Response response = client().performRequest(new Request("GET", "/_cat/indices?format=json" + "&expand_wildcards=all"));
+        final Response response = client().performRequest(new Request("GET", "/_cat/indices?format=json"));
         try (
             final XContentParser parser = JsonXContent.jsonXContent.createParser(
                 NamedXContentRegistry.EMPTY,
