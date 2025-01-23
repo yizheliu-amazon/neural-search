@@ -6,6 +6,7 @@ package org.opensearch.neuralsearch;
 
 import org.apache.http.Header;
 import org.apache.http.HttpHost;
+import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.ParseException;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -42,6 +43,13 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.rest.OpenSearchRestTestCase;
 
+import java.io.IOException;
+
+import io.github.acm19.aws.interceptor.http.AwsRequestSigningApacheInterceptor;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.http.auth.aws.signer.AwsV4HttpSigner;
+import software.amazon.awssdk.regions.Region;
+
 /**
  * Base class for running the integration tests on a secure cluster. The plugin IT test should either extend this
  * class or create another base class by extending this class to make sure that their IT can be run on secure clusters.
@@ -54,6 +62,12 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
     private static final String SYS_PROPERTY_KEY_CLUSTER_ENDPOINT = "tests.rest.cluster";
     private static final String SYS_PROPERTY_KEY_USER = "user";
     private static final String SYS_PROPERTY_KEY_PASSWORD = "password";
+    private static final String SYS_PROPERTY_KEY_AWS_ACCESS_KEY_ID = "aws.accessKeyId";
+    private static final String SYS_PROPERTY_KEY_AWS_SECRET_ACCESS_KEY = "aws.secretKey";
+    private static final String SYS_PROPERTY_KEY_AWS_SERVICE = "aws.service";
+    private static final String SYS_PROPERTY_KEY_AWS_REGION = "aws.region";
+    private static final String SYS_PROPERTY_KEY_ACCOUNT_ID = "accountId";
+    private static final String SYS_PROPERTY_KEY_COLLECTION_ID = "collectionId";
     private static final String DEFAULT_SOCKET_TIMEOUT = "60s";
     private static final String INTERNAL_INDICES_PREFIX = ".";
     private static String protocol;
@@ -98,29 +112,73 @@ public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCas
     }
 
     private void configureHttpsClient(final RestClientBuilder builder, final Settings settings) {
-        final Map<String, String> headers = ThreadContext.buildDefaultHeaders(settings);
-        final Header[] defaultHeaders = new Header[headers.size()];
-        int i = 0;
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            defaultHeaders[i++] = new BasicHeader(entry.getKey(), entry.getValue());
-        }
-        builder.setDefaultHeaders(defaultHeaders);
-        builder.setHttpClientConfigCallback(httpClientBuilder -> {
-            final String userName = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_USER))
-                .orElseThrow(() -> new RuntimeException("user name is missing"));
-            final String password = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_PASSWORD))
-                .orElseThrow(() -> new RuntimeException("password is missing"));
-            final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-            credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(userName, password));
-            try {
-                return httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider)
-                    // disable the certificate since our testing cluster just uses the default security configuration
-                    .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
-                    .setSSLContext(SSLContextBuilder.create().loadTrustMaterial(null, (chains, authType) -> true).build());
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+        if (System.getProperty(SYS_PROPERTY_KEY_AWS_SERVICE) != null) {
+            final String awsService = System.getProperty(SYS_PROPERTY_KEY_AWS_SERVICE);
+            if (awsService.equalsIgnoreCase("aoss")) {
+                final Region awsRegion = Region.of(System.getProperty(SYS_PROPERTY_KEY_AWS_REGION));
+                final String accountId = System.getProperty(SYS_PROPERTY_KEY_ACCOUNT_ID);
+                final String collectionId = System.getProperty(SYS_PROPERTY_KEY_COLLECTION_ID);
+                if (accountId.isEmpty() || collectionId.isEmpty()) {
+                    throw new RuntimeException("AOSS collection info is missing. Check if accountId and collectionId are both provided.");
+                }
+                final Map<String, String> headers = ThreadContext.buildDefaultHeaders(settings);
+                headers.put("X-Amzn-Aoss-Account-Id", accountId);
+                headers.put("X-Amzn-Aoss-Collection-Id", collectionId);
+                final Header[] defaultHeaders = new Header[headers.size()];
+                int i = 0;
+                for (Map.Entry<String, String> entry : headers.entrySet()) {
+                    defaultHeaders[i++] = new BasicHeader(entry.getKey(), entry.getValue());
+                }
+                builder.setDefaultHeaders(defaultHeaders);
+
+                builder.setHttpClientConfigCallback(httpClientBuilder -> {
+                    final String awsAccessKeyId = System.getProperty(SYS_PROPERTY_KEY_AWS_ACCESS_KEY_ID);
+                    final String awsSecretKey = System.getProperty(SYS_PROPERTY_KEY_AWS_SECRET_ACCESS_KEY);
+                    if (awsAccessKeyId.isEmpty() || awsSecretKey.isEmpty()) {
+                        throw new RuntimeException(
+                            "AWS credential is missing. Check if aws.AccessKeyId and aws.SecretKey are both provided."
+                        );
+                    }
+                    HttpRequestInterceptor awsRequestSigningInterceptor = new AwsRequestSigningApacheInterceptor(
+                        awsService,
+                        AwsV4HttpSigner.create(),
+                        DefaultCredentialsProvider.create(),
+                        awsRegion
+                    );
+                    try {
+                        return httpClientBuilder.addInterceptorLast(awsRequestSigningInterceptor);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            } else {
+                throw new IllegalArgumentException("Unrecognized AWS service name.");
             }
-        });
+        } else {
+            final Map<String, String> headers = ThreadContext.buildDefaultHeaders(settings);
+            final Header[] defaultHeaders = new Header[headers.size()];
+            int i = 0;
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                defaultHeaders[i++] = new BasicHeader(entry.getKey(), entry.getValue());
+            }
+            builder.setDefaultHeaders(defaultHeaders);
+            builder.setHttpClientConfigCallback(httpClientBuilder -> {
+                final String userName = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_USER))
+                    .orElseThrow(() -> new RuntimeException("user name is missing"));
+                final String password = Optional.ofNullable(System.getProperty(SYS_PROPERTY_KEY_PASSWORD))
+                    .orElseThrow(() -> new RuntimeException("password is missing"));
+                final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(userName, password));
+                try {
+                    return httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider)
+                        // disable the certificate since our testing cluster just uses the default security configuration
+                        .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                        .setSSLContext(SSLContextBuilder.create().loadTrustMaterial(null, (chains, authType) -> true).build());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
 
         final String socketTimeoutString = settings.get(CLIENT_SOCKET_TIMEOUT);
         final TimeValue socketTimeout = TimeValue.parseTimeValue(
