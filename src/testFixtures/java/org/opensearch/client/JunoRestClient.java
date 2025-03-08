@@ -14,17 +14,20 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
 import lombok.SneakyThrows;
 import lombok.Value;
 import org.apache.http.Header;
 import org.apache.http.HttpHost;
+import org.apache.http.HttpResponse;
+import org.apache.http.ProtocolVersion;
+import org.apache.http.RequestLine;
 import org.apache.http.client.config.RequestConfig;
+import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.core.LoggerContext;
-import org.apache.logging.log4j.core.config.Configuration;
-import org.apache.logging.log4j.core.config.LoggerConfig;
+import org.apache.http.message.BasicHttpResponse;
+import org.apache.http.message.BasicRequestLine;
+import org.apache.http.message.BasicStatusLine;
 
 /**
  * Client that connects to an OpenSearch cluster through HTTP.
@@ -77,39 +80,41 @@ public class JunoRestClient extends RestClient implements Closeable {
     );
 
     private final RestClient remoteRestClient;
+
     JunoRestClient(
-            CloseableHttpAsyncClient client,
-            Header[] defaultHeaders,
-            List<Node> nodes,
-            String pathPrefix,
-            FailureListener failureListener,
-            NodeSelector nodeSelector,
-            boolean strictDeprecationMode,
-            boolean compressionEnabled,
-            boolean chunkedEnabled
+        CloseableHttpAsyncClient client,
+        Header[] defaultHeaders,
+        List<Node> nodes,
+        String pathPrefix,
+        FailureListener failureListener,
+        NodeSelector nodeSelector,
+        boolean strictDeprecationMode,
+        boolean compressionEnabled,
+        boolean chunkedEnabled
     ) {
         super(
-                client,
-                defaultHeaders,
-                nodes,
-                pathPrefix,
-                failureListener,
-                nodeSelector,
-                strictDeprecationMode,
-                compressionEnabled,
-                chunkedEnabled
+            client,
+            defaultHeaders,
+            nodes,
+            pathPrefix,
+            failureListener,
+            nodeSelector,
+            strictDeprecationMode,
+            compressionEnabled,
+            chunkedEnabled
         );
         remoteRestClient = buildRemoteClient();
     }
+
     JunoRestClient(
-            CloseableHttpAsyncClient client,
-            Header[] defaultHeaders,
-            List<Node> nodes,
-            String pathPrefix,
-            FailureListener failureListener,
-            NodeSelector nodeSelector,
-            boolean strictDeprecationMode,
-            boolean compressionEnabled
+        CloseableHttpAsyncClient client,
+        Header[] defaultHeaders,
+        List<Node> nodes,
+        String pathPrefix,
+        FailureListener failureListener,
+        NodeSelector nodeSelector,
+        boolean strictDeprecationMode,
+        boolean compressionEnabled
     ) {
         super(client, defaultHeaders, nodes, pathPrefix, failureListener, nodeSelector, strictDeprecationMode, compressionEnabled);
         remoteRestClient = buildRemoteClient();
@@ -125,63 +130,73 @@ public class JunoRestClient extends RestClient implements Closeable {
     public synchronized void setNodes(Collection<Node> nodes) {
         super.setNodes(nodes);
     }
+
     @Override
     public List<Node> getNodes() {
         return List.of(new Node(new HttpHost(COLLECTION_HOST, 433, "https")));
     }
+
     @Override
     public boolean isRunning() {
         return super.isRunning() || remoteRestClient.isRunning();
     }
+
     @Override
     public void close() throws IOException {
         super.close();
         remoteRestClient.close();
     }
+
     @Override
     public Response performRequest(Request request) throws IOException {
         for (var entry : API_HANDLERS.entrySet()) {
             if (entry.getKey().getMethod().equals(request.getMethod())
-                    && entry.getKey().getEndpoint().matcher(request.getEndpoint()).matches()) {
+                && entry.getKey().getEndpoint().matcher(request.getEndpoint()).matches()) {
                 return entry.getValue().handle(this, request);
             }
         }
         notSupported(String.format("performRequest(%s, %s)", request.getMethod(), request.getEndpoint()));
         return null;
     }
+
     @Override
     public Cancellable performRequestAsync(Request request, ResponseListener responseListener) {
         notSupported("performRequestAsync()");
         return null;
     }
+
     private static void notSupported(String method) {
         throw new UnsupportedOperationException(method + " is not supported by JunoRestClient");
     }
+
     private static boolean matches(List<Pattern> patterns, String str) {
         return patterns.stream().map(p -> p.matcher(str)).anyMatch(Matcher::matches);
     }
 
     private static Response callLocal(JunoRestClient client, Request request) {
         request.setOptions(
-                RequestOptions.DEFAULT.toBuilder()
-                        .setRequestConfig(
-                                RequestConfig.copy(RequestConfig.DEFAULT)
-                                        .setSocketTimeout((int) TIMEOUT.toMillis())
-                                        .setConnectionRequestTimeout((int) TIMEOUT.toMillis())
-                                        .build()
-                        )
+            RequestOptions.DEFAULT.toBuilder()
+                .setRequestConfig(
+                    RequestConfig.copy(RequestConfig.DEFAULT)
+                        .setSocketTimeout((int) TIMEOUT.toMillis())
+                        .setConnectionRequestTimeout((int) TIMEOUT.toMillis())
                         .build()
+                )
+                .build()
         );
         return client.performRequestSuper(request);
     }
+
     @SneakyThrows
     private static Response callRemote(JunoRestClient client, Request request) {
         return client.remoteRestClient.performRequest(request);
     }
+
     @SneakyThrows
     private Response performRequestSuper(Request request) {
         return super.performRequest(request);
     }
+
     @SneakyThrows
     private static Response noop(JunoRestClient client, Request request) {
         ProtocolVersion protocolVersion = new ProtocolVersion("HTTP", 2, 0);
@@ -191,11 +206,13 @@ public class JunoRestClient extends RestClient implements Closeable {
         response.setEntity(new StringEntity("{}"));
         return new Response(requestLine, host, response);
     }
+
     @Value
     private static final class ApiId {
         private final String method;
         private final Pattern endpoint;
     }
+
     private static interface ApiHandler {
         Response handle(JunoRestClient client, Request request);
     }

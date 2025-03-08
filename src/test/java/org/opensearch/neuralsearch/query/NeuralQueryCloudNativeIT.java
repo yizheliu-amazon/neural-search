@@ -30,7 +30,7 @@ public class NeuralQueryCloudNativeIT extends OpenSearchSecureRestTestCase {
         log.info("Hello world");
         try {
             // Change the hard code model id to env variable
-            Response response = client().performRequest(new Request("GET", "/_plugins/_ml/models/eec0cfe2-64b6-4a52-9d62-94007e1d3b16"));
+            Response response = client().performRequest(new Request("GET", "/_plugins/_ml/models/46803f57-f27a-4526-a8b5-2bcb226bbf96"));
             throw new ResponseException(response);
         } catch (ResponseException e) {
             System.out.println(Arrays.toString(e.getResponse().getHeaders()) + ' ' + EntityUtils.toString(e.getResponse().getEntity()));
