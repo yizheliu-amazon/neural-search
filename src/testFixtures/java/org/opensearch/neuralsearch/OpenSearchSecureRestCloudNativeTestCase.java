@@ -49,7 +49,7 @@ import software.amazon.awssdk.regions.Region;
  * Base class for running the integration tests on a secure cluster. The plugin IT test should either extend this
  * class or create another base class by extending this class to make sure that their IT can be run on secure clusters.
  */
-public abstract class OpenSearchSecureRestTestCase extends OpenSearchRestTestCase {
+public abstract class OpenSearchSecureRestCloudNativeTestCase extends OpenSearchRestTestCase {
 
     private static final String PROTOCOL_HTTP = "http";
     private static final String PROTOCOL_HTTPS = "https";

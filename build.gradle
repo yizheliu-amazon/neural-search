@@ -254,6 +254,7 @@ dependencies {
     testFixturesApi 'software.amazon.awssdk:auth:2.27.17'
     testFixturesImplementation 'software.amazon.awssdk:aws-core'
     testFixturesImplementation 'software.amazon.awssdk:regions'
+    testFixturesImplementation 'software.amazon.awssdk:http-auth-aws-crt'
     testFixturesImplementation group: 'io.github.acm19', name: 'aws-request-signing-apache-interceptor', version: '3.0.0'
     zipArchive group: 'org.opensearch.plugin', name:'opensearch-knn', version: "${opensearch_build}"
     zipArchive group: 'org.opensearch.plugin', name:'opensearch-ml-plugin', version: "${opensearch_build}"
@@ -437,6 +438,7 @@ task integTestJuno(type: RestIntegTestTask) {
     systemProperty 'aws.region', System.getProperty('aws.region')
     systemProperty 'accountId', System.getProperty('accountId')
     systemProperty 'collectionId', System.getProperty('collectionId')
+    systemProperty 'collection.host', System.getProperty('collection.host')
 
     systemProperty 'cluster.number_of_nodes', "${_numNodes}"
 

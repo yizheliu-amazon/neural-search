@@ -1,2 +1,2 @@
-{ "index": { "_index": "{{index}}", "_id": "{{id}}" } },
+{ "index": { "_index": "{{index}}" } },
 {{doc}}

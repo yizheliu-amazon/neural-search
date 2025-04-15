@@ -13,11 +13,11 @@
     "properties": {
       "title_knn": {
         "type": "knn_vector",
-        "dimension": 768,
+        "dimension": 1024,
         "method": {
           "name": "hnsw",
           "space_type": "l2",
-          "engine": "lucene",
+          "engine": "faiss",
           "parameters": {
             "ef_construction": 128,
             "m": 24
@@ -26,11 +26,11 @@
       },
       "favorites.game_knn": {
         "type": "knn_vector",
-        "dimension": 768,
+        "dimension": 1024,
         "method": {
           "name": "hnsw",
           "space_type": "l2",
-          "engine": "lucene",
+          "engine": "faiss",
           "parameters": {
             "ef_construction": 128,
             "m": 24
@@ -39,11 +39,11 @@
       },
       "favorites.movie_knn": {
         "type": "knn_vector",
-        "dimension": 768,
+        "dimension": 1024,
         "method": {
           "name": "hnsw",
           "space_type": "l2",
-          "engine": "lucene",
+          "engine": "faiss",
           "parameters": {
             "ef_construction": 128,
             "m": 24
@@ -55,11 +55,11 @@
         "properties": {
           "knn": {
             "type": "knn_vector",
-            "dimension": 768,
+            "dimension": 1024,
             "method": {
               "name": "hnsw",
               "space_type": "l2",
-              "engine": "lucene",
+              "engine": "faiss",
               "parameters": {
                 "ef_construction": 128,
                 "m": 24
@@ -70,11 +70,11 @@
       },
       "passage_embedding": {
         "type": "knn_vector",
-        "dimension": 768,
+        "dimension": 1024,
         "method": {
           "name": "hnsw",
           "space_type": "l2",
-          "engine": "lucene",
+          "engine": "faiss",
           "parameters": {
             "ef_construction": 128,
             "m": 24
@@ -92,11 +92,11 @@
           },
           "embedding": {
             "type": "knn_vector",
-            "dimension": 768,
+            "dimension": 1024,
             "method": {
               "name": "hnsw",
               "space_type": "l2",
-              "engine": "lucene",
+              "engine": "faiss",
               "parameters": {
                 "ef_construction": 128,
                 "m": 24
@@ -113,11 +113,11 @@
                 "properties": {
                   "level_3_embedding": {
                     "type": "knn_vector",
-                    "dimension": 768,
+                    "dimension": 1024,
                     "method": {
                       "name": "hnsw",
                       "space_type": "l2",
-                      "engine": "lucene",
+                      "engine": "faiss",
                       "parameters": {
                         "ef_construction": 128,
                         "m": 24

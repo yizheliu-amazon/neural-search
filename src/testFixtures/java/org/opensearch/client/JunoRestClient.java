@@ -4,8 +4,11 @@
  */
 package org.opensearch.client;
 
+import java.io.BufferedReader;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collection;
@@ -19,15 +22,21 @@ import lombok.SneakyThrows;
 import lombok.Value;
 import org.apache.http.Header;
 import org.apache.http.HttpHost;
+import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.HttpResponse;
 import org.apache.http.ProtocolVersion;
 import org.apache.http.RequestLine;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
 import org.apache.http.message.BasicHttpResponse;
 import org.apache.http.message.BasicRequestLine;
 import org.apache.http.message.BasicStatusLine;
+import org.opensearch.neuralsearch.interceptor.AWSHttpRequestSigningInterceptor;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.http.auth.aws.signer.AwsV4HttpSigner;
+import software.amazon.awssdk.identity.spi.AwsCredentialsIdentity;
 
 /**
  * Client that connects to an OpenSearch cluster through HTTP.
@@ -47,16 +56,32 @@ import org.apache.http.message.BasicStatusLine;
  * Requests can be traced by enabling trace logging for "tracer". The trace logger outputs requests and responses in curl format.
  */
 public class JunoRestClient extends RestClient implements Closeable {
+    private static final String SYS_PROPERTY_KEY_AWS_SERVICE = "aws.service";
+    private static final String SYS_PROPERTY_KEY_AWS_REGION = "aws.region";
+    private static final String SYS_PROPERTY_KEY_COLLECTION_HOST = "collection.host";
+    private static final String COLLECTION_HOST = System.getProperty(SYS_PROPERTY_KEY_COLLECTION_HOST);
+    private static final String COLLECTION_ENDPOINT = "https://" + COLLECTION_HOST;
     private static final Duration TIMEOUT = Duration.ofMinutes(1);
     private static final String INDEX_NAME_PATTERN = "(\\w|\\.|-|\\+|_|\\d)+";
     private static final String DOC_ID_PATTERN = INDEX_NAME_PATTERN;
     private static final Map<ApiId, ApiHandler> API_HANDLERS = Map.ofEntries(
         // not actually supported, opensearch test framework is calling this so for now we will bypass
-        Map.entry(new ApiId("GET", Pattern.compile("^.*_nodes/plugins.*$")), JunoRestClient::noop),
+        Map.entry(new ApiId("GET", Pattern.compile("^.*_nodes/plugins.*$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("GET", Pattern.compile("^/_plugins/_ml/.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("POST", Pattern.compile("^/_plugins/_ml/.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("PUT", Pattern.compile("^.*_search.*$")), JunoRestClient::callRemote),
         Map.entry(new ApiId("POST", Pattern.compile("^.*_search.*$")), JunoRestClient::noop),
         Map.entry(new ApiId("GET", Pattern.compile("^.*_search.*$")), JunoRestClient::noop),
         Map.entry(new ApiId("GET", Pattern.compile("^/_cat/indices.*$")), JunoRestClient::callRemote),
-        Map.entry(new ApiId("GET", Pattern.compile("^/_cat/indices.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("GET", Pattern.compile("^/_snapshot/_all$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("DELETE", Pattern.compile("^_data_stream/.*$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("DELETE", Pattern.compile("^_template/.*$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("DELETE", Pattern.compile("^_index_template/.*$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("DELETE", Pattern.compile("^_component_template/.*$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("POST", Pattern.compile("^_bulk.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("GET", Pattern.compile("^/_tasks$")), JunoRestClient::callLocal),
+        Map.entry(new ApiId("DELETE", Pattern.compile("^/_search/pipeline/.*$")), JunoRestClient::noop),
+        Map.entry(new ApiId("PUT", Pattern.compile("^/_ingest/pipeline/.*$")), JunoRestClient::callRemote),
         Map.entry(new ApiId("HEAD", Pattern.compile("^/" + INDEX_NAME_PATTERN + "$")), JunoRestClient::callRemote),
         Map.entry(new ApiId("PUT", Pattern.compile("^/" + INDEX_NAME_PATTERN + "$")), JunoRestClient::callRemote),
         Map.entry(
@@ -65,7 +90,11 @@ public class JunoRestClient extends RestClient implements Closeable {
         ),
         // Map.entry(new ApiId("DELETE", Pattern.compile("^/" + INDEX_NAME_PATTERN + "$")), JunoRestClient::callRemote),
         Map.entry(new ApiId("POST", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_bulk.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("GET", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_search.*$")), JunoRestClient::callRemote),
         Map.entry(new ApiId("PUT", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_settings.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("POST", Pattern.compile("^" + INDEX_NAME_PATTERN + "/_doc.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("POST", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_doc.*$")), JunoRestClient::callRemote),
+        Map.entry(new ApiId("GET", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_count$")), JunoRestClient::callRemote),
         Map.entry(
             new ApiId("PUT", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_doc/" + DOC_ID_PATTERN + ".*$")),
             JunoRestClient::callRemote
@@ -74,6 +103,9 @@ public class JunoRestClient extends RestClient implements Closeable {
             new ApiId("POST", Pattern.compile("^/" + INDEX_NAME_PATTERN + "/_doc/" + DOC_ID_PATTERN + ".*$")),
             JunoRestClient::callRemote
         ),
+        Map.entry(new ApiId("GET", Pattern.compile("^/_cluster/.*$")), JunoRestClient::callLocal),
+        // avoid deleting index on remote
+        Map.entry(new ApiId("DELETE", Pattern.compile("^/" + INDEX_NAME_PATTERN + "$")), JunoRestClient::callRemote),
         // not actually supported, letting it fail at the gateway
         Map.entry(new ApiId("PUT", Pattern.compile("^/_cluster/settings$")), JunoRestClient::callRemote)
     // Map.entry(new ApiId("PUT", Pattern.compile("^/_cluster/settings$")), JunoRestClient::noop)
@@ -119,6 +151,25 @@ public class JunoRestClient extends RestClient implements Closeable {
         super(client, defaultHeaders, nodes, pathPrefix, failureListener, nodeSelector, strictDeprecationMode, compressionEnabled);
         remoteRestClient = buildRemoteClient();
     }
+
+    private RestClient buildRemoteClient() {
+        return RestClient.builder(HttpHost.create(COLLECTION_ENDPOINT)).setHttpClientConfigCallback(config -> {
+            configureSigV4Signing(config, DefaultCredentialsProvider.create().resolveCredentials());
+            return config;
+        }).build();
+    }
+
+    private void configureSigV4Signing(HttpAsyncClientBuilder builder, AwsCredentialsIdentity awsCredentialsProvider) {
+        HttpRequestInterceptor interceptor = new AWSHttpRequestSigningInterceptor(
+            System.getProperty(SYS_PROPERTY_KEY_AWS_SERVICE),
+            System.getProperty(SYS_PROPERTY_KEY_AWS_REGION),
+            AwsV4HttpSigner.create(),
+            awsCredentialsProvider,
+            COLLECTION_HOST
+        );
+        builder.addInterceptorLast(interceptor);
+    }
+
     public static JunoRestClientBuilder junoBuilder(HttpHost... hosts) {
         if (hosts == null || hosts.length == 0) {
             throw new IllegalArgumentException("hosts must not be null nor empty");
@@ -126,6 +177,7 @@ public class JunoRestClient extends RestClient implements Closeable {
         List<Node> nodes = Arrays.stream(hosts).map(Node::new).collect(Collectors.toList());
         return new JunoRestClientBuilder(nodes);
     }
+
     @Override
     public synchronized void setNodes(Collection<Node> nodes) {
         super.setNodes(nodes);
@@ -152,11 +204,26 @@ public class JunoRestClient extends RestClient implements Closeable {
         for (var entry : API_HANDLERS.entrySet()) {
             if (entry.getKey().getMethod().equals(request.getMethod())
                 && entry.getKey().getEndpoint().matcher(request.getEndpoint()).matches()) {
+                System.out.println("Performing JunoRest request: " + request);
+                if (request.getEntity() != null) {
+                    System.out.println("Performing JunoRest requestContent: " + printInputStream(request.getEntity().getContent()));
+                }
                 return entry.getValue().handle(this, request);
             }
         }
-        notSupported(String.format("performRequest(%s, %s)", request.getMethod(), request.getEndpoint()));
+        notSupported(String.format("performRequest for JunoCollection (%s, %s)", request.getMethod(), request.getEndpoint()));
         return null;
+    }
+
+    private String printInputStream(InputStream inputStream) throws IOException {
+        StringBuilder stringBuilder = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                stringBuilder.append(line).append("\n");
+            }
+        }
+        return stringBuilder.toString();
     }
 
     @Override

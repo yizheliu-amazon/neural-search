@@ -11,7 +11,7 @@ import org.junit.Test;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
-import org.opensearch.neuralsearch.OpenSearchSecureRestTestCase;
+import org.opensearch.neuralsearch.BaseNeuralSearchCloudNativeIT;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -20,19 +20,22 @@ import java.util.Locale;
 import static org.apache.http.entity.ContentType.APPLICATION_JSON;
 
 @Log4j2
-public class NeuralQueryCloudNativeIT extends OpenSearchSecureRestTestCase {
+public class NeuralQueryCloudNativeIT extends BaseNeuralSearchCloudNativeIT {
     private static final String SERVICE_NAME = "aoss";
     private static final String ACCOUNT_ID = "058264223758";
     private static final String COLLECTION_ID = "iqgbxpohpaemd8jwyui2";
 
     @Test
     public void testGetModel() throws IOException {
-        log.info("Hello world");
         try {
+            System.out.println("Before sending request");
             // Change the hard code model id to env variable
             Response response = client().performRequest(new Request("GET", "/_plugins/_ml/models/46803f57-f27a-4526-a8b5-2bcb226bbf96"));
-            throw new ResponseException(response);
+            System.out.println("Have successfully got response");
+            System.out.println(EntityUtils.toString(response.getEntity()));
+            // throw new ResponseException(response);
         } catch (ResponseException e) {
+            System.out.println("Exception is caught during getModel:");
             System.out.println(Arrays.toString(e.getResponse().getHeaders()) + ' ' + EntityUtils.toString(e.getResponse().getEntity()));
         }
     }
@@ -60,9 +63,13 @@ public class NeuralQueryCloudNativeIT extends OpenSearchSecureRestTestCase {
                 )
             );
             Response putResponse = client().performRequest(request);
+            System.out.println("Have successfully got putResponse");
+            System.out.println(EntityUtils.toString(putResponse.getEntity()));
             Response getResponse = client().performRequest(new Request("GET", "/_search/pipeline/phase-results-pipeline"));
-            throw new ResponseException(getResponse);
+            System.out.println("Have successfully got getResponse");
+            System.out.println(EntityUtils.toString(getResponse.getEntity()));
         } catch (ResponseException e) {
+            System.out.println("Exception is caught during getIndex:");
             System.out.println(Arrays.toString(e.getResponse().getHeaders()) + ' ' + EntityUtils.toString(e.getResponse().getEntity()));
         }
     }
