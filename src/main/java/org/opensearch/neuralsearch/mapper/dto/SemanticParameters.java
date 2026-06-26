@@ -32,4 +32,6 @@ public class SemanticParameters {
     }
 
     private final Boolean skipExistingEmbedding;
+    private final String language;
+    private final String modelType;
 }

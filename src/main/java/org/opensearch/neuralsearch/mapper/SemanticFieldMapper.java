@@ -211,6 +211,22 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
             false
         );
 
+        @Getter
+        protected final Parameter<String> language = Parameter.stringParam(
+            "language",
+            true,
+            m -> ((SemanticFieldMapper) m).semanticParameters.getLanguage(),
+            null
+        );
+
+        @Getter
+        protected final Parameter<String> modelType = Parameter.stringParam(
+            "model_type",
+            true,
+            m -> ((SemanticFieldMapper) m).semanticParameters.getModelType(),
+            null
+        );
+
         @Setter
         protected ParametrizedFieldMapper.Builder delegateBuilder;
 
@@ -229,7 +245,9 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 semanticFieldSearchAnalyzer,
                 denseEmbeddingConfig,
                 sparseEncodingConfig,
-                skipExistingEmbedding
+                skipExistingEmbedding,
+                language,
+                modelType
             );
         }
 
@@ -261,6 +279,8 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .denseEmbeddingConfig(denseEmbeddingConfig.getValue())
                 .sparseEncodingConfig(sparseEncodingConfig.getValue())
                 .skipExistingEmbedding(skipExistingEmbedding.getValue())
+                .language(language.getValue())
+                .modelType(modelType.getValue())
                 .build();
         }
     }

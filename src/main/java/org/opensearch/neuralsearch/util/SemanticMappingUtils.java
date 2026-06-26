@@ -125,6 +125,10 @@ public class SemanticMappingUtils {
         for (Map.Entry<String, Map<String, Object>> entry : semanticFieldPathToConfigMap.entrySet()) {
             final String fullPath = entry.getKey();
             final Map<String, Object> fieldConfigMap = entry.getValue();
+            // Skip managed-model fields (no model_id yet — handled by ASE plugin)
+            if (fieldConfigMap.get(MODEL_ID) == null) {
+                continue;
+            }
             final String modelIdStr = getModelId(fieldConfigMap, fullPath);
             if (modelIdToFieldPathMap.containsKey(modelIdStr) == false) {
                 modelIdToFieldPathMap.put(modelIdStr, new ArrayList<>());
@@ -221,8 +225,19 @@ public class SemanticMappingUtils {
      */
     public static String validateModelId(@NonNull final String semanticFieldPath, @NonNull final Map<String, Object> semanticFieldConfig) {
         Object modelId = semanticFieldConfig.get(MODEL_ID);
+        boolean hasManagedParams = semanticFieldConfig.containsKey("language") || semanticFieldConfig.containsKey("model_type");
         if (modelId == null) {
-            return String.format(Locale.ROOT, "%s is required for the semantic field at %s", MODEL_ID, semanticFieldPath);
+            // Skip validation — handled by ASE plugin (defaults to managed sparse english if no params specified)
+            return null;
+        }
+        // Conflict: model_id + language/model_type
+        if (hasManagedParams) {
+            return String.format(
+                Locale.ROOT,
+                "model_id cannot be combined with language/model_type for the semantic field at %s. "
+                    + "Choose a customer-provided model (model_id) or AWS-managed model (language/model_type), not both.",
+                semanticFieldPath
+            );
         }
 
         if (modelId instanceof String == false || ((String) modelId).isEmpty()) {
