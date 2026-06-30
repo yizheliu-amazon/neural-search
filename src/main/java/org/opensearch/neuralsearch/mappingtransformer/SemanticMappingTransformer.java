@@ -274,6 +274,11 @@ public class SemanticMappingTransformer implements MappingTransformer {
             // Set model_id on the field config
             fieldConfig.put("model_id", modelId);
 
+            // For dense models, set engine=lucene (avoids faiss native lib requirement)
+            if ("DENSE".equalsIgnoreCase(modelType) && !fieldConfig.containsKey("dense_embedding_config")) {
+                fieldConfig.put("dense_embedding_config", Map.of("method", Map.of("engine", "lucene")));
+            }
+
             // Now fetch model metadata and expand (reuse existing logic)
             Map<String, Map<String, Object>> singleField = Map.of(fieldPath, fieldConfig);
             fetchModelAndModifyMapping(
