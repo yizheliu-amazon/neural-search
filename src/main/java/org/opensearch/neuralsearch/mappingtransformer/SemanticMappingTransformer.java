@@ -35,11 +35,17 @@ import static org.opensearch.neuralsearch.util.SemanticMappingUtils.getPropertie
 import static org.opensearch.neuralsearch.util.SemanticMappingUtils.validateModelId;
 import static org.opensearch.neuralsearch.util.SemanticMappingUtils.validateSemanticInfoFieldName;
 
+import org.opensearch.neuralsearch.ml.resolver.SemanticModelResolver;
+
 /**
  * SemanticMappingTransformer transforms the index mapping for the semantic field to auto add the semantic info fields
  * based on the ML model id defined in the semantic field.
  */
 public class SemanticMappingTransformer implements MappingTransformer {
+    private static final org.apache.logging.log4j.Logger log = org.apache.logging.log4j.LogManager.getLogger(
+        SemanticMappingTransformer.class
+    );
+
     public final static Set<String> SUPPORTED_MODEL_ALGORITHMS = Set.of(
         FunctionName.TEXT_EMBEDDING.name(),
         FunctionName.REMOTE.name(),
@@ -52,12 +58,33 @@ public class SemanticMappingTransformer implements MappingTransformer {
         FunctionName.SPARSE_TOKENIZE.name()
     );
 
-    private final MLCommonsClientAccessor mlClientAccessor;
-    private final NamedXContentRegistry xContentRegistry;
+    private volatile MLCommonsClientAccessor mlClientAccessor;
+    private volatile NamedXContentRegistry xContentRegistry;
+    private volatile SemanticModelResolver modelResolver;
 
     public SemanticMappingTransformer(final MLCommonsClientAccessor mlClientAccessor, final NamedXContentRegistry xContentRegistry) {
         this.mlClientAccessor = mlClientAccessor;
         this.xContentRegistry = xContentRegistry;
+    }
+
+    public void setMlClientAccessor(MLCommonsClientAccessor accessor) {
+        this.mlClientAccessor = accessor;
+    }
+
+    public void setXContentRegistry(NamedXContentRegistry registry) {
+        this.xContentRegistry = registry;
+    }
+
+    /**
+     * Set the model resolver. If not set, managed-model fields (with language/model_type) will be skipped.
+     * Call this after plugin loading to inject the resolver (OSS default or managed override).
+     */
+    public void setModelResolver(SemanticModelResolver resolver) {
+        this.modelResolver = resolver;
+    }
+
+    public SemanticModelResolver getModelResolver() {
+        return this.modelResolver;
     }
 
     /**
@@ -144,7 +171,36 @@ public class SemanticMappingTransformer implements MappingTransformer {
 
             validateSemanticFields(semanticFieldPathToConfigMap);
 
-            fetchModelAndModifyMapping(semanticFieldPathToConfigMap, properties, listener);
+            // Split: fields with model_id go to neural-search's existing path;
+            // fields with language/model_type (no model_id) go to the resolver path.
+            final Map<String, Map<String, Object>> modelIdFields = new HashMap<>();
+            final Map<String, Map<String, Object>> managedFields = new HashMap<>();
+            for (Map.Entry<String, Map<String, Object>> entry : semanticFieldPathToConfigMap.entrySet()) {
+                if (entry.getValue().get("model_id") != null) {
+                    modelIdFields.put(entry.getKey(), entry.getValue());
+                } else {
+                    managedFields.put(entry.getKey(), entry.getValue());
+                }
+            }
+
+            log.info("SemanticMappingTransformer: modelIdFields={}, managedFields={}, resolver={}", modelIdFields.size(), managedFields.size(), modelResolver != null ? "SET" : "NULL");
+
+            // Handle model_id fields first (existing logic)
+            ActionListener<Void> afterModelIdFields = ActionListener.wrap(v -> {
+                // Then handle managed-model fields via resolver
+                if (managedFields.isEmpty() || modelResolver == null) {
+                    log.info("Skipping managed fields: empty={}, resolver={}", managedFields.isEmpty(), modelResolver == null ? "NULL" : "SET");
+                    listener.onResponse(null);
+                    return;
+                }
+                resolveManagedFields(managedFields, properties, listener);
+            }, listener::onFailure);
+
+            if (modelIdFields.isEmpty()) {
+                afterModelIdFields.onResponse(null);
+            } else {
+                fetchModelAndModifyMapping(modelIdFields, properties, afterModelIdFields);
+            }
         } catch (Exception e) {
             listener.onFailure(e);
         }
@@ -168,6 +224,58 @@ public class SemanticMappingTransformer implements MappingTransformer {
         if (errors.isEmpty() == false) {
             throw new IllegalArgumentException(String.join("; ", errors));
         }
+    }
+
+    /**
+     * Resolve managed-model fields sequentially via the SemanticModelResolver.
+     * For each field: resolve language/model_type → model_id, set it on the config,
+     * then fetch model metadata and expand semantic_info (same as model_id fields).
+     */
+    private void resolveManagedFields(
+        @NonNull final Map<String, Map<String, Object>> managedFields,
+        @NonNull final Map<String, Object> mappings,
+        @NonNull final ActionListener<Void> listener
+    ) {
+        var iterator = managedFields.entrySet().iterator();
+        resolveNextField(iterator, mappings, listener);
+    }
+
+    private void resolveNextField(
+        java.util.Iterator<Map.Entry<String, Map<String, Object>>> iterator,
+        Map<String, Object> mappings,
+        ActionListener<Void> listener
+    ) {
+        if (!iterator.hasNext()) {
+            listener.onResponse(null);
+            return;
+        }
+
+        Map.Entry<String, Map<String, Object>> entry = iterator.next();
+        String fieldPath = entry.getKey();
+        Map<String, Object> fieldConfig = entry.getValue();
+
+        String language = fieldConfig.get("language") != null
+            ? fieldConfig.get("language").toString().toUpperCase(java.util.Locale.ROOT)
+            : "ENGLISH";
+        String modelType = fieldConfig.get("model_type") != null
+            ? fieldConfig.get("model_type").toString().toUpperCase(java.util.Locale.ROOT)
+            : "SPARSE";
+
+        modelResolver.resolve(language, modelType, ActionListener.wrap(modelId -> {
+            // Set model_id on the field config
+            fieldConfig.put("model_id", modelId);
+
+            // Now fetch model metadata and expand (reuse existing logic)
+            Map<String, Map<String, Object>> singleField = Map.of(fieldPath, fieldConfig);
+            fetchModelAndModifyMapping(
+                singleField,
+                mappings,
+                ActionListener.wrap(v -> resolveNextField(iterator, mappings, listener), listener::onFailure)
+            );
+        }, e -> {
+            log.error("Failed to resolve managed model for field [{}]: {}", fieldPath, e.getMessage());
+            listener.onFailure(e);
+        }));
     }
 
     private void fetchModelAndModifyMapping(
@@ -195,12 +303,33 @@ public class SemanticMappingTransformer implements MappingTransformer {
             for (String fieldPath : fieldPathList) {
                 try {
                     final Map<String, Object> fieldConfig = semanticFieldPathToConfigMap.get(fieldPath);
+                    // For pretrained dense models, additionalConfig may not have space_type.
+                    // Inject it so SemanticInfoConfigBuilder can read it.
+                    ensureSpaceTypeForTextEmbeddingModel(mlModel);
                     final Map<String, Object> semanticInfoConfig = createSemanticInfoField(mlModel, modelId, fieldConfig, fieldPath);
                     setSemanticInfoField(mappings, fieldPath, fieldConfig.get(SEMANTIC_INFO_FIELD_NAME), semanticInfoConfig);
                 } catch (IllegalArgumentException e) {
                     throw new IllegalArgumentException(getModifyMappingErrorMessage(fieldPath, e.getMessage()), e);
                 } catch (Exception e) {
                     throw new RuntimeException(getModifyMappingErrorMessage(fieldPath, e.getMessage()), e);
+                }
+            }
+        }
+    }
+
+    private void ensureSpaceTypeForTextEmbeddingModel(MLModel mlModel) {
+        if (mlModel.getAlgorithm() == org.opensearch.ml.common.FunctionName.TEXT_EMBEDDING
+            || (mlModel.getAlgorithm() == org.opensearch.ml.common.FunctionName.REMOTE
+                && mlModel.getModelConfig() != null
+                && "TEXT_EMBEDDING".equals(mlModel.getModelConfig().getModelType()))) {
+            if (mlModel.getModelConfig() instanceof org.opensearch.ml.common.model.TextEmbeddingModelConfig teConfig) {
+                java.util.Map<String, Object> additional = teConfig.getAdditionalConfig();
+                if (additional == null || !(additional.get("space_type") instanceof String)) {
+                    java.util.Map<String, Object> patched = additional != null
+                        ? new java.util.HashMap<>(additional)
+                        : new java.util.HashMap<>();
+                    patched.put("space_type", "l2");
+                    teConfig.setAdditionalConfig(patched);
                 }
             }
         }

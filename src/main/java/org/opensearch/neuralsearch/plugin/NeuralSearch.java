@@ -185,6 +185,7 @@ public class NeuralSearch extends Plugin
         EnginePlugin,
         CircuitBreakerPlugin {
     private MLCommonsClientAccessor clientAccessor;
+    private SemanticMappingTransformer semanticMappingTransformer;
     private NamedXContentRegistry xContentRegistry;
     private NormalizationProcessorWorkflow normalizationProcessorWorkflow;
     private NeuralSearchSettingsAccessor settingsAccessor;
@@ -241,6 +242,15 @@ public class NeuralSearch extends Plugin
         // Initialize the semantic highlighter
         this.semanticHighlighter.initialize(semanticHighlighterEngine);
         this.semanticHighlighter.setClusterService(clusterService);
+
+        // Set clientAccessor + resolver on the transformer (created before createComponents ran)
+        if (semanticMappingTransformer != null) {
+            semanticMappingTransformer.setMlClientAccessor(clientAccessor);
+            semanticMappingTransformer.setXContentRegistry(xContentRegistry);
+            semanticMappingTransformer.setModelResolver(
+                new org.opensearch.neuralsearch.ml.resolver.PretrainedSemanticModelResolver(new MachineLearningNodeClient(client))
+            );
+        }
 
         return List.of(clientAccessor, EventStatsManager.instance(), infoStatsManager);
     }
@@ -456,7 +466,8 @@ public class NeuralSearch extends Plugin
 
     @Override
     public List<MappingTransformer> getMappingTransformers() {
-        return List.of(new SemanticMappingTransformer(clientAccessor, xContentRegistry));
+        semanticMappingTransformer = new SemanticMappingTransformer(clientAccessor, xContentRegistry);
+        return List.of(semanticMappingTransformer);
     }
 
     @Override
