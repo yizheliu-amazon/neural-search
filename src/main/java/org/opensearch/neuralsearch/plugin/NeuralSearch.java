@@ -467,6 +467,12 @@ public class NeuralSearch extends Plugin
     @Override
     public List<MappingTransformer> getMappingTransformers() {
         semanticMappingTransformer = new SemanticMappingTransformer(clientAccessor, xContentRegistry);
+        // Set resolver here — getMappingTransformers runs AFTER createComponents in OpenSearch 3.3
+        if (clientAccessor != null) {
+            semanticMappingTransformer.setModelResolver(
+                new org.opensearch.neuralsearch.ml.resolver.PretrainedSemanticModelResolver(clientAccessor.getMlClient())
+            );
+        }
         return List.of(semanticMappingTransformer);
     }
 

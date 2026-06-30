@@ -183,13 +183,22 @@ public class SemanticMappingTransformer implements MappingTransformer {
                 }
             }
 
-            log.info("SemanticMappingTransformer: modelIdFields={}, managedFields={}, resolver={}", modelIdFields.size(), managedFields.size(), modelResolver != null ? "SET" : "NULL");
+            log.info(
+                "SemanticMappingTransformer: modelIdFields={}, managedFields={}, resolver={}",
+                modelIdFields.size(),
+                managedFields.size(),
+                modelResolver != null ? "SET" : "NULL"
+            );
 
             // Handle model_id fields first (existing logic)
             ActionListener<Void> afterModelIdFields = ActionListener.wrap(v -> {
                 // Then handle managed-model fields via resolver
                 if (managedFields.isEmpty() || modelResolver == null) {
-                    log.info("Skipping managed fields: empty={}, resolver={}", managedFields.isEmpty(), modelResolver == null ? "NULL" : "SET");
+                    log.info(
+                        "Skipping managed fields: empty={}, resolver={}",
+                        managedFields.isEmpty(),
+                        modelResolver == null ? "NULL" : "SET"
+                    );
                     listener.onResponse(null);
                     return;
                 }

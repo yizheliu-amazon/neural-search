@@ -83,6 +83,10 @@ public class MLCommonsClientAccessor {
     private final MachineLearningNodeClient mlClient;
     private static final Gson gson = new Gson();
 
+    public MachineLearningNodeClient getMlClient() {
+        return mlClient;
+    }
+
     // Error message constants for conversational agent responses
     private static final String CONVERSATIONAL_AGENT_INVALID_JSON_ERROR = "Conversational agent response does not contain valid JSON. "
         + "The agent must return a response containing a JSON object with 'dsl_query' field. "
