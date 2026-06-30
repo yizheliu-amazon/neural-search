@@ -76,7 +76,7 @@ def start_cluster():
     print(f"    PID: {proc.pid}")
 
     # Wait up to 90s for cluster to be green
-    client = OpenSearch(hosts=[{"host": "localhost", "port": 9200}])
+    client = OpenSearch(hosts=[{"host": "localhost", "port": 9200}], timeout=180)
     for i in range(18):
         time.sleep(5)
         try:
