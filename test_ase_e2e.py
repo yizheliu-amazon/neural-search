@@ -118,14 +118,14 @@ def get_model_id_and_wait(client, index_name):
         return None
 
     # Brief wait for deployment to fully propagate
-    for i in range(12):
+    for i in range(60):
         try:
             resp = client.transport.perform_request("GET", f"/_plugins/_ml/models/{model_id}")
             if resp.get("model_state") == "DEPLOYED":
                 return model_id
         except Exception:
             pass
-        time.sleep(5)
+        time.sleep(1)
     print(f"    WARNING: Model {model_id} not fully deployed after 60s, proceeding anyway")
     return model_id
 
@@ -145,7 +145,7 @@ def test_sparse(client):
     except Exception:
         pass
 
-    resp = client.indices.create(index=index_name, body={
+    create_body = {
         "mappings": {
             "properties": {
                 "passage": {
@@ -155,8 +155,11 @@ def test_sparse(client):
                 }
             }
         }
-    })
-    print(f"    Created: {resp['acknowledged']}")
+    }
+    print(f"    Request: PUT /{index_name}")
+    print(f"    Body: {json.dumps(create_body, indent=4)}")
+    resp = client.indices.create(index=index_name, body=create_body)
+    print(f"    Response: {json.dumps(resp, indent=4)}")
 
     # Verify mapping
     mapping = client.indices.get_mapping(index=index_name)
@@ -226,7 +229,7 @@ def test_dense(client):
     except Exception:
         pass
 
-    resp = client.indices.create(index=index_name, body={
+    create_body = {
         "settings": {"index.knn": True},
         "mappings": {
             "properties": {
@@ -236,8 +239,11 @@ def test_dense(client):
                 }
             }
         }
-    })
-    print(f"    Created: {resp['acknowledged']}")
+    }
+    print(f"    Request: PUT /{index_name}")
+    print(f"    Body: {json.dumps(create_body, indent=4)}")
+    resp = client.indices.create(index=index_name, body=create_body)
+    print(f"    Response: {json.dumps(resp, indent=4)}")
 
     # Verify mapping
     mapping = client.indices.get_mapping(index=index_name)
