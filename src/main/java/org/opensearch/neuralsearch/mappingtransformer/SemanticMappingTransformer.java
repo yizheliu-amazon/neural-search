@@ -271,8 +271,10 @@ public class SemanticMappingTransformer implements MappingTransformer {
             : "SPARSE";
 
         modelResolver.resolve(language, modelType, ActionListener.wrap(modelId -> {
-            // Set model_id on the field config
+            // Set model_id, language, model_type on the field config (ensure defaults are stored)
             fieldConfig.put("model_id", modelId);
+            fieldConfig.put("language", language);
+            fieldConfig.put("model_type", modelType);
 
             // For dense models, set engine=lucene (avoids faiss native lib requirement)
             if ("DENSE".equalsIgnoreCase(modelType) && !fieldConfig.containsKey("dense_embedding_config")) {
