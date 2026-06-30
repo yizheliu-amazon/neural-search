@@ -105,32 +105,13 @@ def configure_ml(client):
     print("    Done.")
 
 
-def wait_for_model(client, index_name, timeout=120):
-    """Wait for the model associated with an index to be deployed."""
+def get_model_id(client, index_name):
+    """Get the model_id from a semantic field in the index mapping."""
     mapping = client.indices.get_mapping(index=index_name)
     props = mapping[index_name]["mappings"]["properties"]
-    # Find the semantic field
     for field_name, field_config in props.items():
         if field_config.get("type") == "semantic":
-            model_id = field_config.get("model_id")
-            if model_id:
-                print(f"    Model ID: {model_id}, waiting for deploy...")
-                start = time.time()
-                while time.time() - start < timeout:
-                    try:
-                        resp = client.transport.perform_request("GET", f"/_plugins/_ml/models/{model_id}")
-                        state = resp.get("model_state")
-                        if state == "DEPLOYED":
-                            print(f"    Model DEPLOYED ({int(time.time()-start)}s)")
-                            return model_id
-                        elif state == "DEPLOY_FAILED":
-                            # Retry deploy
-                            client.transport.perform_request("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
-                    except Exception:
-                        pass
-                    time.sleep(5)
-                print(f"    WARNING: Model not deployed within {timeout}s")
-                return model_id
+            return field_config.get("model_id")
     return None
 
 
@@ -171,8 +152,9 @@ def test_sparse(client):
     has_semantic_info = "passage_semantic_info" in mapping[index_name]["mappings"]["properties"]
     print(f"    Has semantic_info: {has_semantic_info}")
 
-    # Wait for model
-    model_id = wait_for_model(client, index_name)
+    # Get model_id (model is already deployed — transformer waits inline)
+    model_id = get_model_id(client, index_name)
+    print(f"    Resolved model_id: {model_id}")
 
     # Ingest
     print("\n>>> Ingesting documents...")
@@ -252,8 +234,9 @@ def test_dense(client):
     print(f"    embedding.dimension: {emb_field.get('dimension')}")
     print(f"    embedding.method: {emb_field.get('method')}")
 
-    # Wait for model
-    model_id = wait_for_model(client, index_name)
+    # Get model_id (model is already deployed — transformer waits inline)
+    model_id = get_model_id(client, index_name)
+    print(f"    Resolved model_id: {model_id}")
 
     # Ingest
     print("\n>>> Ingesting documents...")
