@@ -105,14 +105,29 @@ def configure_ml(client):
     print("    Done.")
 
 
-def get_model_id(client, index_name):
-    """Get the model_id from a semantic field in the index mapping."""
+def get_model_id_and_wait(client, index_name):
+    """Get model_id from mapping and wait until it's fully deployed (up to 60s)."""
     mapping = client.indices.get_mapping(index=index_name)
     props = mapping[index_name]["mappings"]["properties"]
+    model_id = None
     for field_name, field_config in props.items():
         if field_config.get("type") == "semantic":
-            return field_config.get("model_id")
-    return None
+            model_id = field_config.get("model_id")
+            break
+    if not model_id:
+        return None
+
+    # Brief wait for deployment to fully propagate
+    for i in range(12):
+        try:
+            resp = client.transport.perform_request("GET", f"/_plugins/_ml/models/{model_id}")
+            if resp.get("model_state") == "DEPLOYED":
+                return model_id
+        except Exception:
+            pass
+        time.sleep(5)
+    print(f"    WARNING: Model {model_id} not fully deployed after 60s, proceeding anyway")
+    return model_id
 
 
 def test_sparse(client):
@@ -152,9 +167,9 @@ def test_sparse(client):
     has_semantic_info = "passage_semantic_info" in mapping[index_name]["mappings"]["properties"]
     print(f"    Has semantic_info: {has_semantic_info}")
 
-    # Get model_id (model is already deployed — transformer waits inline)
-    model_id = get_model_id(client, index_name)
-    print(f"    Resolved model_id: {model_id}")
+    # Get model_id and wait for deployment to fully propagate
+    model_id = get_model_id_and_wait(client, index_name)
+    print(f"    Model ready: {model_id}")
 
     # Ingest
     print("\n>>> Ingesting documents...")
@@ -234,9 +249,9 @@ def test_dense(client):
     print(f"    embedding.dimension: {emb_field.get('dimension')}")
     print(f"    embedding.method: {emb_field.get('method')}")
 
-    # Get model_id (model is already deployed — transformer waits inline)
-    model_id = get_model_id(client, index_name)
-    print(f"    Resolved model_id: {model_id}")
+    # Get model_id and wait for deployment to fully propagate
+    model_id = get_model_id_and_wait(client, index_name)
+    print(f"    Model ready: {model_id}")
 
     # Ingest
     print("\n>>> Ingesting documents...")
