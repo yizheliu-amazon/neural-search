@@ -149,9 +149,7 @@ def test_sparse(client):
         "mappings": {
             "properties": {
                 "passage": {
-                    "type": "semantic",
-                    "language": "ENGLISH",
-                    "model_type": "SPARSE"
+                    "type": "semantic"
                 }
             }
         }

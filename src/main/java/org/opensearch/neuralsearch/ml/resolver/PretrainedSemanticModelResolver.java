@@ -28,7 +28,7 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
 
     private static final Logger log = LogManager.getLogger(PretrainedSemanticModelResolver.class);
 
-    public static final String SPARSE_ENGLISH_MODEL = "amazon/neural-sparse/opensearch-neural-sparse-encoding-v1";
+    public static final String SPARSE_ENGLISH_MODEL = "amazon/neural-sparse/opensearch-neural-sparse-encoding-v2-distill";
     public static final String SPARSE_MULTILINGUAL_MODEL = "amazon/neural-sparse/opensearch-neural-sparse-encoding-multilingual-v1";
     public static final String DENSE_ENGLISH_MODEL = "huggingface/sentence-transformers/all-MiniLM-L6-v2";
 
