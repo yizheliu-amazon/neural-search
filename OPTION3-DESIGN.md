@@ -1,113 +1,108 @@
-# Option 3: Managed Model Provider Library
+# Option 3: SemanticModelResolver Interface + Managed Patch
 
 ## Overview
 
-A **library jar** (`opensearch-model-provider`) that contains managed-service-specific model resolution logic. Managed neural-search depends on it as a compile-time dependency and uses `ManagedSemanticModelResolver` instead of the OSS default `PretrainedSemanticModelResolver`.
+All `language`/`model_type` resolution logic lives in **OSS neural-search** behind a `SemanticModelResolver` interface. The managed service fork (AWSOpenSearchNeuralSearchPlugin) adds one file (`ManagedSemanticModelResolver.java`) and swaps one line to use it.
 
-No ExtensiblePlugin, no SPI, no runtime discovery — just a direct dependency swap in the managed fork.
+No separate library. No extra package. No dependency complexity.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ neural-search (OSS)                                                  │
-│                                                                      │
-│  SemanticModelResolver (interface)                                   │
-│    └── void resolve(language, modelType, listener)                   │
-│    └── void validate(language, modelType)                            │
-│                                                                      │
-│  PretrainedSemanticModelResolver (default OSS impl)                  │
-│    └── Registers pretrained models from hub, polls, caches           │
-│                                                                      │
-│  SemanticMappingTransformer                                          │
-│    └── Uses resolver.resolve() for fields without model_id           │
-│    └── resolver is set in NeuralSearch.getMappingTransformers()      │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ OSS neural-search (synced from GitHub via AutoSync)               │
+│                                                                   │
+│  SemanticModelResolver (interface)                                │
+│    • resolve(language, modelType, listener) → model_id            │
+│    • validate(language, modelType)                                │
+│    • providesStaticExpansion() → boolean                          │
+│    • buildSemanticInfoConfig(language, modelType) → Map           │
+│                                                                   │
+│  PretrainedSemanticModelResolver (default implementation)         │
+│    • Registers pretrained models from OpenSearch model hub        │
+│    • Polls task until deployed, caches model_ids                  │
+│    • Used in OSS / self-managed deployments                       │
+│                                                                   │
+│  SemanticMappingTransformer                                       │
+│    • Splits fields: model_id → existing path; no model_id → resolver │
+│    • Resolver set in NeuralSearch.getMappingTransformers()        │
+│                                                                   │
+│  SemanticFieldMapper                                              │
+│    • Accepts language/model_type as stored parameters             │
+│    • Returns them in GET response                                 │
+└──────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────┐
-│ opensearch-model-provider (library jar, closed-source)               │
-│                                                                      │
-│  ManagedSemanticModelResolver                                        │
-│    └── Returns hardcoded managed model IDs (constants)               │
-│    └── No registration, no deployment — models pre-deployed          │
-│    └── providesStaticExpansion() → builds semantic_info directly     │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│ managed neural-search (closed-source fork, patches OSS)              │
-│                                                                      │
-│  Depends on: opensearch-model-provider (compile dependency)          │
-│  Patch: one line in NeuralSearch.getMappingTransformers():            │
-│                                                                      │
-│    // OSS:                                                           │
-│    resolver = new PretrainedSemanticModelResolver(mlClient);          │
-│                                                                      │
-│    // Managed (patched):                                             │
-│    resolver = new ManagedSemanticModelResolver();                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Managed neural-search patch (AWSOpenSearchNeuralSearchPlugin)     │
+│                                                                   │
+│  What AutoSync gives us: entire OSS source (including above)     │
+│                                                                   │
+│  Patch adds:                                                      │
+│    1. ManagedSemanticModelResolver.java (~50 lines, new file)    │
+│       • Returns hardcoded managed model IDs instantly             │
+│       • providesStaticExpansion() = true                          │
+│       • Builds semantic_info from known constants (no getModel)   │
+│                                                                   │
+│    2. One-line swap in NeuralSearch.getMappingTransformers():     │
+│       - new PretrainedSemanticModelResolver(mlClient)             │
+│       + new ManagedSemanticModelResolver()                        │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## What Lives Where
 
-| Component | Location | Visibility |
+| Component | Location | Open/Closed |
 | --- | --- | --- |
-| `SemanticModelResolver` interface | neural-search (OSS) | Open-source |
-| `PretrainedSemanticModelResolver` | neural-search (OSS) | Open-source |
-| `language`/`model_type` parameters on SemanticFieldMapper | neural-search (OSS) | Open-source |
-| Resolver integration in SemanticMappingTransformer | neural-search (OSS) | Open-source |
-| `ManagedSemanticModelResolver` | opensearch-model-provider (library) | Closed-source |
-| One-line resolver swap | managed neural-search fork | Closed-source |
+| `SemanticModelResolver` interface | neural-search OSS source | Open-source |
+| `PretrainedSemanticModelResolver` | neural-search OSS source | Open-source |
+| `language`/`model_type` on SemanticFieldMapper | neural-search OSS source | Open-source |
+| Resolver integration in SemanticMappingTransformer | neural-search OSS source | Open-source |
+| Skip-validation patch (validateModelId) | neural-search OSS source | Open-source |
+| `ManagedSemanticModelResolver` | Managed patch (1 new file) | Closed-source |
+| Resolver swap (1 line) | Managed patch | Closed-source |
 
 ## How It Works
 
-### OSS path (self-managed OpenSearch)
+### OSS (self-managed OpenSearch)
 
-1. Customer creates index with `{"type": "semantic", "language": "ENGLISH", "model_type": "SPARSE"}`
-2. `SemanticMappingTransformer` sees no `model_id`, calls `PretrainedSemanticModelResolver.resolve()`
-3. Resolver registers pretrained model from hub (e.g., `amazon/neural-sparse/opensearch-neural-sparse-encoding-v1`), polls until deployed
-4. Sets `model_id` on field config, fetches model metadata via `getModel()`, expands `semantic_info`
-5. Index created with working ingest + search
+1. Customer: `PUT /index {"type":"semantic", "language":"ENGLISH", "model_type":"SPARSE"}`
+2. `SemanticMappingTransformer`: no model_id → calls `PretrainedSemanticModelResolver.resolve()`
+3. Resolver registers `amazon/neural-sparse/opensearch-neural-sparse-encoding-v2-distill` via ML Commons
+4. Polls task until DEPLOYED → gets model_id
+5. Calls `getModel()` → reads dimension/space_type → `SemanticInfoConfigBuilder` expands semantic_info
+6. Sets model_id + language + model_type on field config
+7. Index created, ingest + search work
 
-### Managed service path (AOS/AOSS)
+### Managed service (AOS/AOSS)
 
 1. Same customer request
-2. `SemanticMappingTransformer` calls `ManagedSemanticModelResolver.resolve()`
-3. Resolver immediately returns hardcoded model ID (e.g., `managed-inference-sparse-model-id`) — no registration, no deployment
-4. Since `providesStaticExpansion() = true`, builds `semantic_info` directly from known constants (dimension, space_type) — no `getModel()` call needed
-5. Index created instantly
+2. `SemanticMappingTransformer`: no model_id → calls `ManagedSemanticModelResolver.resolve()`
+3. Resolver instantly returns `"managed-inference-sparse-model-id"` (hardcoded constant)
+4. Since `providesStaticExpansion() = true`: builds semantic_info directly from known constants (rank_features for sparse, knn_vector dim 768 for dense)
+5. No model registration, no deployment, no getModel call
+6. Index created instantly
 
-## The One-Line Patch
+## The Managed Patch (2 changes total)
 
-In the managed neural-search fork, `NeuralSearch.getMappingTransformers()`:
-
-```java
-// OSS version:
-semanticMappingTransformer.setModelResolver(
-    new PretrainedSemanticModelResolver(clientAccessor.getMlClient())
-);
-
-// Managed version (the only change):
-semanticMappingTransformer.setModelResolver(
-    new ManagedSemanticModelResolver()
-);
-```
-
-## ManagedSemanticModelResolver Implementation
+### Change 1: New file `ManagedSemanticModelResolver.java`
 
 ```java
+package org.opensearch.neuralsearch.ml.resolver;
+
 public class ManagedSemanticModelResolver implements SemanticModelResolver {
 
-    public static final String MANAGED_SPARSE_ENGLISH_MODEL_ID = "managed-inference-sparse-model-id";
-    public static final String MANAGED_SPARSE_MULTILINGUAL_MODEL_ID = "managed-inference-multilingual-model-id";
-    public static final String MANAGED_DENSE_MODEL_ID = "managed-inference-dense-model-id";
+    public static final String MANAGED_SPARSE_EN = "managed-inference-sparse-model-id";
+    public static final String MANAGED_SPARSE_ML = "managed-inference-multilingual-model-id";
+    public static final String MANAGED_DENSE = "managed-inference-dense-model-id";
 
     @Override
     public void resolve(String language, String modelType, ActionListener<String> listener) {
         validate(language, modelType);
-        // Instant resolution — no registration, no network call
-        if ("DENSE".equals(modelType))        listener.onResponse(MANAGED_DENSE_MODEL_ID);
-        else if ("MULTI-LINGUAL".equals(language)) listener.onResponse(MANAGED_SPARSE_MULTILINGUAL_MODEL_ID);
-        else                                  listener.onResponse(MANAGED_SPARSE_ENGLISH_MODEL_ID);
+        String type = modelType != null ? modelType.toUpperCase() : "SPARSE";
+        String lang = language != null ? language.toUpperCase() : "ENGLISH";
+        if ("DENSE".equals(type))             listener.onResponse(MANAGED_DENSE);
+        else if ("MULTI-LINGUAL".equals(lang)) listener.onResponse(MANAGED_SPARSE_ML);
+        else                                   listener.onResponse(MANAGED_SPARSE_EN);
     }
 
     @Override
@@ -115,53 +110,93 @@ public class ManagedSemanticModelResolver implements SemanticModelResolver {
 
     @Override
     public Map<String, Object> buildSemanticInfoConfig(String language, String modelType) {
-        // Build companion field config from known constants (no getModel call)
-        if ("DENSE".equals(modelType)) {
-            return knnVectorConfig(768, "cosinesimil");   // managed dense model specs
+        String type = modelType != null ? modelType.toUpperCase() : "SPARSE";
+        if ("DENSE".equals(type)) {
+            return Map.of("properties", Map.of(
+                "embedding", knnVectorConfig(768, "cosinesimil"),
+                "model", modelMetadataConfig()));
         }
-        return rankFeaturesConfig();  // sparse: no dimension needed
+        return Map.of("properties", Map.of(
+            "embedding", Map.of("type", "rank_features"),
+            "model", modelMetadataConfig()));
     }
 }
 ```
 
-## Managed ML Commons Client
+### Change 2: One-line swap in `NeuralSearch.getMappingTransformers()`
 
-If the managed service needs a different ML Commons interaction pattern (e.g., calling OASis instead of local ML Commons), the `opensearch-model-provider` library can also provide a `ManagedMLCommonsClient` that the managed neural-search fork uses. This follows the same pattern:
+```java
+// Before (OSS default):
+semanticMappingTransformer.setModelResolver(
+    new PretrainedSemanticModelResolver(clientAccessor.getMlClient())
+);
 
-- Interface lives in OSS neural-search (`MLCommonsClientAccessor`)
-- Managed override lives in `opensearch-model-provider`
-- Managed fork patches the wiring
+// After (managed):
+semanticMappingTransformer.setModelResolver(
+    new ManagedSemanticModelResolver()
+);
+```
 
-For v1, this is likely not needed — `ManagedSemanticModelResolver` with `providesStaticExpansion=true` bypasses all ML Commons calls entirely.
+## Why No Separate Library
+
+The managed neural-search (AWSOpenSearchNeuralSearchPlugin) is a **source fork** — it vendors the entire OSS neural-search source via AutoSync and compiles it directly. It does NOT consume the OSS jar.
+
+This means:
+- `SemanticModelResolver` interface is compiled inside the managed plugin itself
+- A separate `opensearch-model-provider` library would need to depend on the managed plugin to see the interface → circular dependency
+- **Solution**: just put `ManagedSemanticModelResolver` directly in the managed source as a patch file — no external dependency needed
 
 ## Pros and Cons
 
 | Dimension | Pro | Con |
 | --- | --- | --- |
-| Simplicity | One-line patch, direct dependency, no runtime magic | — |
-| OSS impact | Zero — interface + default impl are fully open-source | — |
-| Managed footprint | Just a library jar (~10KB) — not a plugin, no memory overhead | — |
-| Maintenance | Library versioned independently; neural-search patch is one line | Must keep interface stable |
-| Open-source path | `SemanticModelResolver` + `language`/`model_type` upstreamed; only model IDs stay closed | — |
-| Build complexity | Just add a jar dependency to managed neural-search | Extra jar to build/publish |
-| No ExtensiblePlugin | No SPI, no loadExtensions, no runtime discovery | Less "pluggable" (but we don't need pluggability) |
+| Simplicity | 1 new file + 1 line change. No extra packages/jars/dependencies | Slightly larger patch than "1 line" (but still ~50 lines, 1 file) |
+| No dependency issues | Everything compiles in one unit. No circular deps | — |
+| OSS-clean | All mechanism (interface, params, resolver integration) is open-source. Only model IDs are closed | — |
+| AutoSync-friendly | Patch is additive (new file + 1 line). No merge conflicts with OSS sync | Must re-apply patch on each sync (trivial for 1 file + 1 line) |
+| Testable | Can test managed resolver with unit tests in the managed package | — |
+| Open-source path | If we upstream managed model concept, just move the file to OSS | — |
+| No memory overhead | No new plugin, no new classloader. Zero runtime cost | — |
 
 ## Comparison with Options 1 and 2
 
-| Dimension | Option 1 (ASE Plugin) | Option 2 (Patch neural-search) | Option 3 (Model Provider Library) |
+| Dimension | Option 1 (Separate ASE Plugin) | Option 2 (All in neural-search) | Option 3 (Interface + Managed Patch) |
 | --- | --- | --- | --- |
-| Closed-source size | 14KB plugin | ~150 lines in neural-search | ~10KB library + 1-line patch |
-| Deployment | Separate plugin to install | Single plugin | Library jar (not a plugin) + patched neural-search |
-| OSS contamination | None (separate plugin) | High (AWS logic in OSS code) | None (interface is OSS-clean) |
-| Open-source path | Plugin can be upstreamed | Must extract AWS logic first | Interface already OSS; library stays closed |
-| Memory overhead | ~14KB (negligible) | Zero | Zero (library loaded by neural-search classloader) |
-| Maintenance | 2 artifacts (plugin + 10-line patch) | 1 artifact (150+ lines) | 2 artifacts (library + 1-line patch) |
-| Resolver swap | ExtensiblePlugin runtime | Hardcoded in neural-search | Compile-time dependency swap |
+| Closed-source footprint | 14KB plugin + 10-line neural-search patch | ~150 lines in neural-search | 1 new file (~50 lines) + 1-line swap |
+| Dependency complexity | Separate plugin, must install alongside | None | None |
+| Circular dep risk | Needs careful plugin load ordering | None | None |
+| OSS contamination | None | High (AWS logic in OSS) | None (only interface in OSS) |
+| AutoSync compatibility | Must maintain separate plugin | Large patch conflicts on sync | Trivial patch, additive only |
+| Open-source path | Plugin can be upstreamed | Must extract first | Interface already OSS; move 1 file to upstream |
+| Memory overhead | ~14KB | Zero | Zero |
+| Build pipeline | New package to build/deploy | Same package | Same package (patch applied at build time) |
+| **model_id optional (ASE to OSS)** | No — ASE logic stays in closed-source plugin; OSS still requires model_id | Partially — logic in OSS but mixed with AWS specifics | **Yes — SemanticModelResolver + language/model_type are fully in OSS. OSS users can use semantic field without providing model_id (resolved to pretrained model automatically). This upstreams the ASE "no model_id needed" experience to open-source.** |
 
-## Why Option 3
+## Validation Rules (handled in OSS, shared by both resolvers)
 
-1. **Cleanest OSS story** — the entire `language`/`model_type` mechanism + `SemanticModelResolver` interface can be upstreamed. Nothing AWS-specific touches OSS code.
-2. **Simplest managed patch** — literally one line changes which resolver to use.
-3. **No plugin overhead** — the library is loaded by neural-search's own classloader, not as a separate plugin. Zero memory cost, no plugin lifecycle.
-4. **Future-proof** — if we add more managed-service substitutions (e.g., `ManagedMLCommonsClient`, `ManagedChunkerProvider`), they all go in the same library. One jar, many overrides.
-5. **No runtime complexity** — no ExtensiblePlugin, no SPI, no service discovery. A compile-time dependency is the simplest possible mechanism.
+| Input | Result |
+| --- | --- |
+| Bare `{"type":"semantic"}` | Default: ENGLISH + SPARSE |
+| `language` not specified | Default: ENGLISH |
+| `model_type` not specified | Default: SPARSE |
+| `model_id` + `language`/`model_type` | 400 — mutually exclusive |
+| DENSE + MULTI-LINGUAL | 400 — not supported |
+| `model_id` alone | Works as before (resolver not invoked) |
+
+## Model Mapping
+
+### OSS (PretrainedSemanticModelResolver)
+
+| language | model_type | Pretrained Model | Version |
+| --- | --- | --- | --- |
+| ENGLISH | SPARSE | opensearch-neural-sparse-encoding-v2-distill | 1.0.0 |
+| MULTI-LINGUAL | SPARSE | opensearch-neural-sparse-encoding-multilingual-v1 | 1.0.1 |
+| ENGLISH | DENSE | all-MiniLM-L6-v2 | 1.0.1 |
+
+### Managed (ManagedSemanticModelResolver)
+
+| language | model_type | Managed Model ID |
+| --- | --- | --- |
+| ENGLISH | SPARSE | managed-inference-sparse-model-id |
+| MULTI-LINGUAL | SPARSE | managed-inference-multilingual-model-id |
+| ENGLISH | DENSE | managed-inference-dense-model-id |
