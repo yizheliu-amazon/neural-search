@@ -156,8 +156,11 @@ def test_sparse(client):
     }
     print(f"    Request: PUT /{index_name}")
     print(f"    Body: {json.dumps(create_body, indent=4)}")
+    t_start = time.time()
     resp = client.indices.create(index=index_name, body=create_body)
+    t_create = time.time() - t_start
     print(f"    Response: {json.dumps(resp, indent=4)}")
+    print(f"    ⏱  CreateIndex took: {t_create:.1f}s")
 
     # Verify mapping
     mapping = client.indices.get_mapping(index=index_name)
@@ -170,7 +173,9 @@ def test_sparse(client):
 
     # Get model_id and wait for deployment to fully propagate
     model_id = get_model_id_and_wait(client, index_name)
+    t_ready = time.time() - t_start
     print(f"    Model ready: {model_id}")
+    print(f"    ⏱  Total time (create + model ready): {t_ready:.1f}s")
 
     # Ingest
     print("\n>>> Ingesting documents...")
@@ -240,8 +245,11 @@ def test_dense(client):
     }
     print(f"    Request: PUT /{index_name}")
     print(f"    Body: {json.dumps(create_body, indent=4)}")
+    t_start = time.time()
     resp = client.indices.create(index=index_name, body=create_body)
+    t_create = time.time() - t_start
     print(f"    Response: {json.dumps(resp, indent=4)}")
+    print(f"    ⏱  CreateIndex took: {t_create:.1f}s")
 
     # Verify mapping
     mapping = client.indices.get_mapping(index=index_name)
@@ -255,7 +263,9 @@ def test_dense(client):
 
     # Get model_id and wait for deployment to fully propagate
     model_id = get_model_id_and_wait(client, index_name)
+    t_ready = time.time() - t_start
     print(f"    Model ready: {model_id}")
+    print(f"    ⏱  Total time (create + model ready): {t_ready:.1f}s")
 
     # Ingest
     print("\n>>> Ingesting documents...")
