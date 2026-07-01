@@ -29,10 +29,11 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
     private static final Logger log = LogManager.getLogger(PretrainedSemanticModelResolver.class);
 
     public static final String SPARSE_ENGLISH_MODEL = "amazon/neural-sparse/opensearch-neural-sparse-encoding-v2-distill";
+    public static final String SPARSE_ENGLISH_MODEL_VERSION = "1.0.0";
     public static final String SPARSE_MULTILINGUAL_MODEL = "amazon/neural-sparse/opensearch-neural-sparse-encoding-multilingual-v1";
+    public static final String SPARSE_MULTILINGUAL_MODEL_VERSION = "1.0.1";
     public static final String DENSE_ENGLISH_MODEL = "huggingface/sentence-transformers/all-MiniLM-L6-v2";
-
-    private static final String MODEL_VERSION = "1.0.1";
+    public static final String DENSE_ENGLISH_MODEL_VERSION = "1.0.1";
 
     private final MachineLearningNodeClient mlClient;
     private final Map<String, String> resolvedModelCache = new ConcurrentHashMap<>();
@@ -54,14 +55,15 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
         }
 
         String modelName = resolveModelName(language, modelType);
+        String modelVersion = resolveModelVersion(language, modelType);
         FunctionName functionName = "DENSE".equalsIgnoreCase(modelType) ? FunctionName.TEXT_EMBEDDING : FunctionName.SPARSE_ENCODING;
 
-        log.info("Registering pretrained model [{}] for [{}/{}]", modelName, language, modelType);
+        log.info("Registering pretrained model [{}] v[{}] for [{}/{}]", modelName, modelVersion, language, modelType);
 
         MLRegisterModelInput input = MLRegisterModelInput.builder()
             .functionName(functionName)
             .modelName(modelName)
-            .version(MODEL_VERSION)
+            .version(modelVersion)
             .modelFormat(MLModelFormat.TORCH_SCRIPT)
             .deployModel(true)
             .build();
@@ -135,6 +137,16 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
             return SPARSE_MULTILINGUAL_MODEL;
         }
         return SPARSE_ENGLISH_MODEL;
+    }
+
+    private String resolveModelVersion(String language, String modelType) {
+        if ("DENSE".equalsIgnoreCase(modelType)) {
+            return DENSE_ENGLISH_MODEL_VERSION;
+        }
+        if ("MULTI-LINGUAL".equalsIgnoreCase(language)) {
+            return SPARSE_MULTILINGUAL_MODEL_VERSION;
+        }
+        return SPARSE_ENGLISH_MODEL_VERSION;
     }
 
     private String normKey(String language, String modelType) {
