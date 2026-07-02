@@ -1,150 +1,145 @@
 # ASE (Automatic Semantic Enrichment) in AOSS
 
-> **Scope.** This section covers *only* how ASE via the `semantic` field
-> (`language` / `model_type` parameters) works differently in **AOSS (Amazon
-> OpenSearch Serverless)**. The general ASE data-plane design (the
-> `SemanticModelResolver` abstraction, the `opensearch-model-provider` library,
-> the managed neural-search fork) is defined in the parent doc and is
-> summarized here only where AOSS diverges from it. The domains/managed-cluster
-> (AOS) integration is also covered in the parent doc.
+> **Scope.** This document covers how ASE via the `semantic` field
+> (`language` / `model_type` parameters) works in **AOSS (Amazon OpenSearch
+> Serverless)**, and how it differs from the managed-cluster (AOS) integration.
 >
 > This design combines two decisions already taken:
+>
 > 1. **AOSS Semantic Field — Option B (MD-centric).** A lightweight
->    `systemIngestPipelineConfig` is pre-computed on the Metadata Service (MD)
->    at write time and stored as index metadata; the Indexing Coordinator (IC)
->    reads it from its existing metadata fetch and builds the system ingest
->    pipeline from it.
-> 2. **ASE DP — Option 3 (Model Provider Library).** A pluggable
->    `SemanticModelResolver` in OSS neural-search, with a
->    `ManagedSemanticModelResolver` (in `opensearch-model-provider`) that returns
->    hard-coded managed model IDs for a `(language, model_type)` pair and
->    reports `providesStaticExpansion() == true` so `semantic_info` can be built
->    from constants with no `getModel()` / ML-Commons round-trip.
+>    `systemIngestPipelineConfig` is pre-computed at write time and stored in the
+>    **PhysicalIndex DynamoDB table** owned by the Metadata Service (MD); the
+>    Indexing Coordinator (IC) reads it from its existing metadata fetch and
+>    builds the system ingest pipeline from it.
+> 2. **ASE — Option 3 (OSS `language`/`model_type` + managed patch, no separate
+>    plugin/library).** The entire mechanism — the `SemanticModelResolver`
+>    interface, the default `PretrainedSemanticModelResolver`, the
+>    `language`/`model_type` parameters, validation, and transformer integration
+>    — lives in **OSS neural-search**. The managed service
+>    (`AWSOpenSearchNeuralSearchPlugin`) is a **source fork** that vendors OSS
+>    neural-search via AutoSync. The managed patch is exactly **one new file**
+>    (`ManagedSemanticModelResolver.java`, ~50 lines) plus a **one-line swap** in
+>    `NeuralSearch.getMappingTransformers()`. There is **no separate library, no
+>    separate plugin, and no separate package** — the managed resolver lives
+>    inside the managed neural-search source as a patch file.
 
 ---
 
 ## 1. TL;DR
 
 In AOSS, a customer creates an index with a `semantic` field parameterized by
-`language` and `model_type` (instead of an explicit `model_id`). The
-`ManagedSemanticModelResolver` maps that pair to a **managed, pre-deployed model
-id** — a constant, resolved without any registration or deployment and without
-calling ML-Commons. Because the managed resolver reports
-`providesStaticExpansion() == true`, the entire `semantic_info` sub-field and
-the ingest transformation (which processor, which field, which model id) are
-**pure functions of the mapping** — no live model lookup is needed.
+`language` and `model_type` (instead of an explicit `model_id`). AOSS uses two
+combined decisions to make this work:
 
-This static property is what makes semantic field fit the MD-centric (Option B)
-model cleanly: MD can compute a `systemIngestPipelineConfig` at CreateIndex time
-from the mapping alone (no OASis/ML-Commons call), persist it as index metadata,
-and IC reconstructs the pipeline from that config on the write path. The managed
-model id is embedded in the config as a constant, so IC never needs to resolve a
-model itself.
+- **Option B (MD-centric):** a lightweight `systemIngestPipelineConfig` is
+  pre-computed and stored in the **PhysicalIndex DynamoDB table**. IC reads it
+  from the metadata fetch it already performs on the write path — no new
+  round-trip, no mapping parse, no model resolution on the hot path.
+- **Option 3 (OSS resolver + managed patch):** all of the mechanism ships in OSS
+  neural-search behind a `SemanticModelResolver` interface. The managed
+  neural-search source fork adds a single patch file,
+  `ManagedSemanticModelResolver.java`, and swaps it in via one line of
+  `NeuralSearch.getMappingTransformers()`. For AOSS, that managed resolver
+  **returns hardcoded global model IDs instantly** — no registration, no
+  deployment, no ML-Commons round-trip. Because the resolved `model_id` is a
+  constant, the whole `semantic_info` sub-field and the ingest transformation are
+  a pure function of the mapping.
 
-Phase 1 delivers this for **CreateIndex** only (matching the MD semantic-field
-validator, which already accepts semantic fields on CreateIndex only). Phase 2
-extends it to PutMapping/PutTemplate once the MD→OASis network path and a slim
-transform module on MD exist.
+This is what lets CreateIndex + config extraction happen at metadata write time
+from the mapping alone. There is **no separate library or plugin** — the managed
+resolver is a patch file inside the managed neural-search source. Phase 1
+delivers CreateIndex + ingest + search; Phase 2 extends to PutMapping /
+PutTemplate + auto-create.
 
 ---
 
-## 2. Why AOSS is different from AOS
+## 2. AOSS vs AOS
+
+Both share the identical OSS mechanism: the `SemanticModelResolver` interface,
+`language`/`model_type` params, validation, and transformer integration all live
+in OSS neural-search, and both AOSS and AOS run a managed source fork that swaps
+in `ManagedSemanticModelResolver`. They differ only in what that one resolver
+does and where the transform runs.
 
 | Concern | AOS (managed clusters) | AOSS (serverless) |
 |---|---|---|
-| Where the transform runs | The neural-search `semantic` mapper + the ingest transformer run **in-process on the cluster node** at mapping-parse and ingest time. The node has the full mapping and can call ML-Commons directly. | There is **no node with the full mapping on the write path**. IC uses `skipMappings=true` and keeps only a slim cluster-state cache; the authoritative mapping lives in MD (DynamoDB). |
-| Model resolution | `ManagedSemanticModelResolver` runs on the cluster and returns the managed model id inline; `providesStaticExpansion()` lets it skip `getModel()`. | The managed model id must be resolved **once, at write time, on the component that owns the mapping (MD / IC)** and then *baked into* index metadata (`systemIngestPipelineConfig`) so the hot write path never resolves a model. |
-| Ingest pipeline plumbing | Standard cluster ingest pipeline resolved from cluster state; auto-generated system pipeline attaches on the node. | No cluster state, no node-local pipeline registry. Pipelines are stored in MD's `PipelineConfig` DDB table and cached on the coordinators; the *system* ingest pipeline for a semantic field must be pre-computed and distributed the same way. |
-| OASis reachability | ML-Commons is co-located (in-cluster). | ML-Commons runs in **OASis**, reachable from OASis-connected components only. In today's topology **MD has no OASis network path** (Phase 2 opens it). |
+| Managed patch | Same one file (`ManagedSemanticModelResolver.java`) + one-line swap in the source fork | Same one file + one-line swap in the source fork |
+| What `ManagedSemanticModelResolver.resolve()` does | **Registers** a model that points at the global OASis model via a connector, then returns that `model_id` | **Returns a hardcoded global model_id constant instantly** — no registration, no deployment |
+| Where the transform runs | Neural-search `semantic` mapper + ingest transformer run **in-process on the cluster node** at mapping-parse / ingest time; the node has the full mapping | **No node with the full mapping on the write path.** IC uses `skipMappings=true`; the authoritative mapping lives in MD (DynamoDB). Transform runs on IC at CreateIndex, output baked into `systemIngestPipelineConfig` |
+| Model deployment cost | One-time registration per `(language, model_type)` | Zero — global model IDs are pre-provisioned constants |
+| Ingest pipeline | Standard cluster-state system ingest pipeline attaches on the node | Pre-computed `systemIngestPipelineConfig` stored in PhysicalIndex DDB; IC materializes it from constants |
 
-**Net:** AOS uses the transformer directly at parse/ingest time; AOSS must take
-the *config-in-DDB* path — resolve the managed model to a constant once, persist
-a `systemIngestPipelineConfig`, and rebuild the pipeline from that config on IC.
-The `providesStaticExpansion()` property of the managed resolver is precisely
-what makes the AOSS path viable without opening MD→OASis in Phase 1.
-
----
-
-## 3. The three blocking issues (recap) and how ASE interacts with each
-
-From the Option B design, three issues block semantic field in AOSS. ASE with
-`language`/`model_type` interacts with each as follows:
-
-1. **No mapping on IC at ingest time (IC uses `skipMappings=true`).**
-   IC cannot look at the mapping to discover that a field is `semantic`, let
-   alone which processor/model to run. → Solved by having MD publish the
-   pre-computed `systemIngestPipelineConfig` as index metadata, which IC already
-   fetches (see §5). ASE adds nothing here beyond ensuring the config carries the
-   managed model id constant.
-
-2. **No transform on PutMapping/PutTemplate (goes directly to MD, which has no
-   OASis).** For AOS, the neural-search mapper transform (build `semantic_info`,
-   resolve model) runs on the node. In AOSS, PutMapping/PutTemplate hit MD
-   directly and MD cannot call OASis. → With `providesStaticExpansion()`, the
-   `semantic_info` expansion and model-id resolution are **static** (constants),
-   so MD can perform the expansion locally **without** an OASis call. This is why
-   ASE-via-managed-models is deliverable on MD earlier than the general
-   arbitrary-`model_id` case.
-
-3. **Pipeline resolved before auto-create, no templates on IC.** For auto-created
-   indices the ingest pipeline is resolved before the index (and its mapping)
-   exists. → Phase 2 concern; addressed by a Template Resolve API on MD that runs
-   the same static expansion against the resolved template so the
-   `systemIngestPipelineConfig` is available before the first write.
+**Net for AOSS:** because the managed resolver returns a *constant*, the whole
+semantic expansion is static, so it fits the config-in-DDB (Option B) path: IC
+resolves the constant once at CreateIndex, persists a `systemIngestPipelineConfig`,
+and rebuilds the pipeline from that config on every write.
 
 ---
 
-## 4. Where `ManagedSemanticModelResolver` runs in AOSS
+## 3. CreateIndex Flow (Phase 1)
 
-`ManagedSemanticModelResolver` (from `opensearch-model-provider`, swapped in via
-the managed neural-search fork's one-line patch) is deployed wherever the
-`semantic` mapper's transform logic executes. In AOSS that is **not** on the hot
-write path — it runs at *metadata write time*:
+CreateIndex flows `SGW → IC → (transform) → MD (store)`. IC runs the managed
+neural-search source fork, so its `SemanticMappingTransformer` invokes the
+patched `ManagedSemanticModelResolver`.
 
-| Path | Component running the resolver | When |
-|---|---|---|
-| **CreateIndex** (Phase 1) | **Indexing Coordinator (IC)** — during the CreateIndex flow, before the final mapping is handed to MD for storage. IC runs the managed neural-search fork; the resolver maps `(language, model_type) → managed model_id` (constant) and, via `providesStaticExpansion()`, builds `semantic_info` and the `systemIngestPipelineConfig` without any `getModel()` / OASis call. | Once, at CreateIndex. |
-| **PutMapping / PutTemplate** (Phase 2) | **Metadata Service (MD)** — a slim transform module (a cut-down neural-search fork carrying only the semantic mapper + `ManagedSemanticModelResolver`) runs the same static expansion on the mapping/template MD receives directly. | Once, at PutMapping/PutTemplate. |
+```
+Customer ──(SigV4)──► SGW ──► IC
+                                │  1. finalize mapping (semantic field with language/model_type)
+                                │  2. SemanticMappingTransformer runs (OSS code)
+                                │  3. ManagedSemanticModelResolver.resolve(language, model_type)
+                                │       └─► returns HARDCODED global model_id  [constant, instant]
+                                │  4. build semantic_info sub-field from constants
+                                │       (no getModel(), no registration, no OASis call)
+                                ▼
+                               MD  ── store expanded mapping (SearchIndex metadata)
+                                   ── extract + store systemIngestPipelineConfig (PhysicalIndex DDB)
+```
 
-Because the managed resolver is *static*, both call sites run **identical,
-side-effect-free** logic. They only ever produce constants; neither registers,
-deploys, nor invokes a model. This is the crucial property that lets the same
-resolver live in two different components without either needing OASis
-connectivity.
+Step by step:
 
-> **Alternative considered:** running the resolver on MD in Phase 1 too (so
-> there is a single home for the transform). Rejected for Phase 1 because MD
-> does not yet embed a neural-search fork and the CreateIndex path already flows
-> **SGW → IC → (transform) → MD (store)** — IC is the natural transform point
-> and already runs the neural-search plugin fork. PutMapping/PutTemplate go
-> **SGW → MD directly**, bypassing IC entirely, which is exactly why they must
-> wait for the MD-side transform module in Phase 2.
+1. **SGW** routes the CreateIndex request to IC (routing unchanged; only the
+   request body must be allowlisted to carry `language`/`model_type`).
+2. **IC** finalizes the mapping and runs the OSS `SemanticMappingTransformer`
+   from the neural-search source fork.
+3. The transformer calls `ManagedSemanticModelResolver.resolve(language,
+   model_type)`, which **returns a hardcoded global model_id** — a constant map
+   lookup. No model registration, no deployment, no ML-Commons round-trip.
+4. Using that constant, the transformer builds the `semantic_info` sub-field
+   (processor type, field map, chunking, dimension, etc.) entirely from
+   constants.
+5. IC hands the expanded mapping to **MD**, which stores it as `SearchIndex`
+   metadata and **extracts `systemIngestPipelineConfig`** into the `PhysicalIndex`
+   DynamoDB record.
+
+The whole path is **instant** — there is no model registration or deployment
+anywhere in the request flow.
 
 ---
 
-## 5. `systemIngestPipelineConfig` — contents and model id
+## 4. `systemIngestPipelineConfig`
 
-The `systemIngestPipelineConfig` is a **lightweight, self-contained descriptor**
-(not a full OpenSearch pipeline object) pre-computed by the transform and stored
-as index metadata. For ASE it **must include the resolved managed model id as a
-constant**, plus everything else IC needs to reconstruct the processor without
-any further resolution.
+A **lightweight, self-contained descriptor** (not a full OpenSearch pipeline
+object) that carries everything IC needs to reconstruct the inference processor
+on the write path without parsing mappings or resolving models. It is extracted
+from the expanded mapping at CreateIndex time and stored in the **PhysicalIndex
+DynamoDB table**.
 
-Per semantic field, the config carries:
+Per semantic field, it carries:
 
 ```jsonc
 {
   "version": 1,
   "semantic_fields": [
     {
-      "field": "product_description",              // the semantic field path
+      "field": "product_description",                    // semantic field path
       "semantic_info_field_name": "product_description_semantic_info",
-      "processor_type": "text_embedding",          // or sparse_encoding, per model_type
-      "model_id": "<MANAGED_MODEL_ID_CONSTANT>",   // resolved by ManagedSemanticModelResolver
-      "model_type": "dense",                        // echoed from mapping
-      "language": "en",                             // echoed from mapping
+      "processor_type": "text_embedding",                // or sparse_encoding, per model_type
+      "model_id": "<HARDCODED_GLOBAL_MODEL_ID>",         // constant from ManagedSemanticModelResolver
+      "model_type": "dense",                             // echoed from mapping
+      "language": "en",                                  // echoed from mapping
       "raw_field_type": "text",
-      "chunking": { ... },                          // if configured
+      "chunking": { ... },                               // if configured
+      "skip_existing_embedding": false,
       "field_map": { "product_description": "product_description_semantic_info.embedding" }
     }
   ]
@@ -153,255 +148,224 @@ Per semantic field, the config carries:
 
 Key points:
 
-- **The model id is a baked-in constant.** Because `providesStaticExpansion()`
-  is true for the managed resolver, the model id is known at transform time and
-  written into the config. IC never resolves `(language, model_type)` itself and
-  never calls a resolver on the hot path.
-- **Storage location.** In Phase 1 the config is stored on the
-  **`PhysicalIndex`** metadata (the extraction layer described in Option B writes
-  it into the PhysicalIndex record after CreateIndex), so IC picks it up through
-  its existing `GetBatchPhysicalIndex` fetch — the same call it already makes to
-  resolve physical indices on the write path. No new fetch is introduced.
-  - *Rationale for PhysicalIndex over the `PipelineConfig` DDB table:* the
-    `PipelineConfig` table is keyed `account_id:collection_id` / `pipeline_type`
-    and is designed for *user-defined* pipelines that coordinators cache and
-    refresh via the notification cron. The **system** ingest pipeline is derived
-    per-index from the mapping, is not user-managed, and must be co-resolved with
-    the physical index IC is already fetching — so it rides on the PhysicalIndex
-    metadata rather than the user pipeline table. (If a future need arises to let
-    the config be edited/observed independently, it can be promoted to a
-    dedicated `pipeline_type` in `PipelineConfig`; not needed for ASE.)
-- **`language`/`model_type` are stored in the mapping** (MD already persists
-  arbitrary semantic params via its lightweight delegating `SemanticFieldMapper`)
-  and are **echoed into the config** for observability and to make the config
-  self-describing. They are also returned verbatim in the GET mapping response
-  (see §6).
-- **No embeddings config leakage.** The config carries only what IC needs to
-  attach the inference processor; the raw-field behavior (`raw_field_type`) is
-  already handled by MD's delegating mapper.
+- **The model_id is a baked-in constant.** Because `ManagedSemanticModelResolver`
+  returns a hardcoded global model ID, the `model_id` is known at CreateIndex
+  time and written into the config verbatim. IC never resolves `(language,
+  model_type)` and never calls a resolver on the hot path.
+- **Storage location — PhysicalIndex DDB.** MD extracts the config during the
+  metadata store and writes it onto the `PhysicalIndex` record. IC picks it up
+  through the **existing** `GetBatchPhysicalIndex` fetch it already makes to
+  resolve physical indices on the write path — no new fetch is introduced.
+- **Why PhysicalIndex rather than the user pipeline table:** the system ingest
+  pipeline is derived per-index from the mapping, is not user-managed, and must
+  be co-resolved with the physical index IC is already fetching — so it rides on
+  the PhysicalIndex metadata IC already reads.
+- **`language`/`model_type` are echoed** into the config for observability and to
+  make it self-describing; they are also stored in the mapping and returned
+  verbatim by GetIndex (see §7).
 
 ---
 
-## 6. How IC builds the system ingest pipeline from the config
+## 5. Ingest Flow
 
 On the write path (`_bulk` / `_doc`), IC does **not** parse mappings and does
-**not** resolve models. It:
-
-1. Resolves the target collection/sIndex/physical index via its cluster-state
-   cache, falling back to `GetBatchPhysicalIndex` on MD (existing behavior).
-2. Reads `systemIngestPipelineConfig` from the fetched PhysicalIndex metadata
-   (new — but rides the existing fetch; no extra round-trip).
-3. If present, **materializes an in-memory system ingest pipeline** from the
-   config: for each `semantic_fields[]` entry it constructs the corresponding
-   inference processor (`text_embedding` for dense / `sparse_encoding` for
-   sparse `model_type`) wired with the **constant `model_id`** and the
-   `field_map` from the config. This is a direct construction from constants —
-   no `IngestService` cluster-state pipeline resolution, no neural-search mapper
-   re-parse.
-4. Prepends the system pipeline to any user-specified ingest pipeline (system
-   enrichment runs first, exactly as in OSS `systemIngestPipeline` semantics),
-   then forwards the enriched documents to the Indexing Worker.
-5. The inference call itself (embedding generation) targets the **managed model
-   in OASis** through the existing ML-Commons inference path used for K-NN /
-   neural search in serverless. Only *inference* touches OASis — *resolution* was
-   already done at write time and baked into the config.
-
-Because the model id is a constant in the config, IC's pipeline construction is
-**deterministic and OASis-independent for resolution**; the only OASis
-dependency at runtime is the embedding inference call, which AOSS already
-supports for existing neural offerings.
-
-> **Idempotency / `skip_existing_embedding`.** If the mapping sets
-> `skip_existing_embedding`, IC honors it the same way the OSS system pipeline
-> does (skip inference when the target `semantic_info` sub-field is already
-> populated on an update). This flag is carried in the config.
-
----
-
-## 7. Component-by-component changes
-
-### Indexing Coordinator (IC) — *Phase 1, primary*
-- Runs the managed neural-search fork with `ManagedSemanticModelResolver`
-  swapped in (one-line patch, per Option 3).
-- **CreateIndex transform:** after the mapping is finalized, run the static
-  semantic expansion — resolve `(language, model_type) → managed model_id`, build
-  `semantic_info`, emit `systemIngestPipelineConfig`. Hand both the expanded
-  mapping and the config to MD to store.
-- **Write path:** read `systemIngestPipelineConfig` from PhysicalIndex metadata;
-  materialize + prepend the system ingest pipeline from constants; run inference
-  against the managed model in OASis.
-- No mapping storage change (IC stays `skipMappings=true`); it only *consumes*
-  the config.
-
-### Metadata Service (MD)
-- **Phase 1:** extend the extraction layer to persist `systemIngestPipelineConfig`
-  onto the `PhysicalIndex` record after CreateIndex, and return it through
-  `GetBatchPhysicalIndex`. MD already registers the `semantic` field type via its
-  lightweight delegating mapper and already stores semantic params (`model_id`,
-  `raw_field_type`, `semantic_info_field_name`, `chunking`, …) — extend the
-  stored param set to include `language` and `model_type`, and extend the
-  semantic-field validator (`validateSemanticFieldTypeEnabled`) to accept
-  `language`/`model_type` (and to require that either an explicit `model_id`
-  *or* a resolvable `(language, model_type)` pair is present).
-- **Phase 2:** embed the **slim transform module** (semantic mapper +
-  `ManagedSemanticModelResolver`) so MD can run the static expansion itself for
-  **PutMapping / PutTemplate** (which bypass IC). Requires the MD→OASis network
-  path *only if* non-static (arbitrary `model_id`) semantic fields are ever
-  supported on these paths; for managed `(language, model_type)` the expansion
-  stays static and no OASis call is needed even on MD.
-- Continue enforcing `MAX_SEMANTIC_FIELDS_PER_INDEX = 10` and the
-  version/flag/collection-type gates already in place.
-
-### Search Coordinator (SC)
-- SC already stores mappings and services search. For semantic-field **query**
-  time, the `neural`/`semantic` query clause resolves the query-side model the
-  same way: with `providesStaticExpansion()`, the `search_model_id` (or the
-  `(language, model_type)`-derived managed query model) is a constant available
-  from the mapping SC already holds. SC needs the managed neural-search fork so
-  its query rewrite picks the managed model id.
-- No `systemIngestPipelineConfig` on SC (that is ingest-only); SC's concern is
-  that the stored mapping round-trips `language`/`model_type` and the derived
-  query model id.
-
-### OASis (ML-Commons)
-- **Must pre-deploy the managed models** referenced by every supported
-  `(language, model_type)` pair, at the constant model ids the
-  `ManagedSemanticModelResolver` returns. This is the single hard dependency: the
-  resolver hands out ids that OASis must already be serving.
-- No registration/deploy API is exercised at CreateIndex/PutMapping — only
-  inference at write/query time. The managed-model deployment is an
-  operational/provisioning task, not part of the request flow.
-
-### Service Gateway (SGW)
-- No functional change to routing. Must ensure the semantic-field CreateIndex
-  request body (with `language`/`model_type`) is on the allowlist for the create
-  path (same allowlisting mechanism used for neural/pipeline features).
-
----
-
-## 8. Request flows
-
-### CreateIndex with a semantic field (Phase 1)
-
-```
-Customer ──(SigV4)──► SGW ──► IC
-                                │  1. finalize mapping
-                                │  2. ManagedSemanticModelResolver:
-                                │       (language, model_type) → managed model_id  [constant]
-                                │  3. providesStaticExpansion(): build semantic_info
-                                │       + systemIngestPipelineConfig  [no getModel(), no OASis]
-                                ▼
-                               MD  ── store expanded mapping (SearchIndex)
-                                   ── store systemIngestPipelineConfig on PhysicalIndex
-```
-
-### Ingest (`_bulk`) into a semantic-field index
+**not** resolve models — it consumes the pre-computed config.
 
 ```
 Customer ──► SGW ──► IC
                       │ 1. resolve pIndex (cluster-state cache / GetBatchPhysicalIndex)
-                      │ 2. read systemIngestPipelineConfig from PhysicalIndex metadata
-                      │ 3. materialize system ingest pipeline from constants
-                      │ 4. run inference processor  ─────────────► OASis (ML-Commons managed model)
-                      │ 5. prepend system pipeline before user pipeline
+                      │ 2. read systemIngestPipelineConfig from cached PhysicalIndex metadata
+                      │ 3. SemanticFieldProcessorFactory builds SemanticFieldProcessor
+                      │      from the config (constant model_id, field_map)
+                      │ 4. SemanticFieldProcessor runs inference ───► OASis (global managed model)
+                      │ 5. prepend system pipeline before any user pipeline
                       ▼
                      Indexing Worker  (writes enriched doc)
 ```
 
-### PutMapping adding a semantic field (Phase 2 only)
+1. IC resolves the target collection / sIndex / physical index via its
+   cluster-state cache, falling back to `GetBatchPhysicalIndex` on MD (existing
+   behavior).
+2. IC reads `systemIngestPipelineConfig` from the **already-cached** PhysicalIndex
+   metadata (rides the existing fetch; no extra round-trip).
+3. `SemanticFieldProcessorFactory` materializes a `SemanticFieldProcessor` from
+   the config: for each `semantic_fields[]` entry it constructs the inference
+   processor (`text_embedding` for dense / `sparse_encoding` for sparse) wired
+   with the **constant `model_id`** and `field_map`. This is direct construction
+   from constants — no cluster-state pipeline resolution, no mapper re-parse.
+4. `SemanticFieldProcessor` calls **OASis** (ML-Commons) with the hardcoded
+   global `model_id` to generate embeddings. Only *inference* touches OASis;
+   *resolution* was done at CreateIndex and baked into the config.
+5. The system pipeline is prepended to any user-specified ingest pipeline (system
+   enrichment first, as in OSS `systemIngestPipeline` semantics), then the
+   enriched docs go to the Indexing Worker.
+
+> **`skip_existing_embedding`.** If set in the mapping, IC honors it the same way
+> the OSS system pipeline does (skip inference when the target `semantic_info`
+> sub-field is already populated on an update). The flag is carried in the config.
+
+---
+
+## 6. Search Flow
+
+**No AOSS-specific search change is required.**
+
+SC stores mappings (`storeMappings=true`), so it already holds the full expanded
+mapping — including the semantic field and its hardcoded global `model_id`. At
+query time:
 
 ```
-Customer ──► SGW ──► MD  (bypasses IC)
+Customer ──► SGW ──► SC
+                      │ 1. NeuralQueryBuilder reads model_id straight from the stored mapping
+                      │ 2. encode query text ───► OASis (global managed model)
+                      │ 3. run knn / rank_features query against semantic_info sub-field
+                      ▼
+                     results
+```
+
+- `NeuralQueryBuilder` reads the `model_id` directly from the stored mapping and
+  calls **OASis** to encode the query text into a vector, then runs the
+  knn/rank_features query against the `semantic_info` sub-field — **identical to
+  any semantic field with an explicit `model_id`**.
+- Because the resolved model is a constant already present in the stored mapping,
+  SC resolves nothing on the hot path. SC runs the managed neural-search source
+  fork only so its query rewrite reads the managed `model_id`.
+
+---
+
+## 7. GetIndex
+
+GetIndex returns the mapping **stored** by MD (`SearchIndex` metadata) — **no
+reconstruction is needed**. The transform persisted `language`, `model_type`, and
+the resolved `model_id` as `SemanticFieldMapper` parameters (MD's lightweight
+delegating mapper serializes semantic params in `toXContent`), so the GET
+response round-trips the semantic field's declared `language`/`model_type` plus
+its expanded `semantic_info` sub-field verbatim. This matches OSS/AOS behavior:
+the client sees exactly what was stored.
+
+---
+
+## 8. PutMapping (Phase 2 only)
+
+PutMapping and PutTemplate flow `SGW → MD directly`, bypassing IC entirely — so
+the IC-side transform in Phase 1 never sees them.
+
+- **Phase 1:** semantic fields on PutMapping/PutTemplate are **not supported** —
+  the existing MD semantic-field validator accepts semantic fields only on direct
+  CreateIndex. This is a deliberate Phase-1 boundary, not a regression.
+- **Phase 2:** MD embeds a **slim transform module** (a cut-down neural-search
+  source fork carrying only the semantic mapper + `ManagedSemanticModelResolver`).
+  Because `ManagedSemanticModelResolver.resolve()` returns a hardcoded global
+  `model_id`, the same static expansion runs on MD with **no OASis call** — MD
+  produces `semantic_info` + `systemIngestPipelineConfig` locally and persists
+  both.
+
+```
+Customer ──► SGW ──► MD  (bypasses IC)          [Phase 2]
                       │ slim transform module:
-                      │   ManagedSemanticModelResolver → managed model_id [constant]
+                      │   ManagedSemanticModelResolver.resolve() → hardcoded model_id [constant]
                       │   static expansion → semantic_info + systemIngestPipelineConfig
                       ▼
                      store expanded mapping + config
 ```
 
-*(In Phase 1, PutMapping adding a semantic field remains **rejected** by the
-existing MD validator — semantic fields are accepted only on direct CreateIndex,
-matching current behavior. This is a deliberate Phase-1 boundary, not a
-regression.)*
+---
+
+## 9. Component Changes
+
+| Component | Phase 1 | Phase 2 |
+|---|---|---|
+| **SGW** | Allowlist the semantic-field CreateIndex body (`language`/`model_type`); routing unchanged | None |
+| **IC** | Run managed neural-search source fork; on CreateIndex, `SemanticMappingTransformer` + `ManagedSemanticModelResolver` resolve the hardcoded `model_id`, build `semantic_info` + `systemIngestPipelineConfig` (no `getModel()`/OASis); on write path, read config from cached PhysicalIndex metadata, build `SemanticFieldProcessor`, prepend system pipeline, run inference against OASis | None (reads same metadata shape) |
+| **MD** | Store `language`/`model_type` in mapping; extract + persist `systemIngestPipelineConfig` on `PhysicalIndex` DDB and return it via `GetBatchPhysicalIndex`; extend semantic-field validator to accept `language`/`model_type` | Embed slim transform module (semantic mapper + `ManagedSemanticModelResolver`) + Template Resolve API to handle PutMapping/PutTemplate/auto-create locally |
+| **SC** | Run managed neural-search source fork so query rewrite reads the hardcoded managed `model_id` from the stored mapping; no functional change beyond that | None |
+| **OASis** | Pre-provision the global managed models at the constant IDs `ManagedSemanticModelResolver` returns; serve inference only | Serve inference for template/auto-created indices; no registration path exercised |
 
 ---
 
-## 9. Phasing
+## 10. Phasing
 
-### Phase 1 — CreateIndex, managed models only
-Deliverable end-to-end with **no MD→OASis network path**, because managed model
-resolution is static:
-- IC runs the managed neural-search fork; static expansion at CreateIndex.
-- MD stores `language`/`model_type` in the mapping and
-  `systemIngestPipelineConfig` on PhysicalIndex; returns it via
+### Phase 1 — CreateIndex + ingest + search
+Deliverable end-to-end **with no MD→OASis network path**, because the managed
+resolver returns constants:
+- IC runs the managed neural-search source fork; static expansion at CreateIndex.
+- MD stores `language`/`model_type` in the mapping and extracts
+  `systemIngestPipelineConfig` onto PhysicalIndex; returns it via
   `GetBatchPhysicalIndex`.
-- IC builds + runs the system ingest pipeline from the config on the write path.
-- OASis pre-deploys the managed models for supported `(language, model_type)`
-  pairs.
-- Query-side: SC resolves the managed query model from the stored mapping.
+- IC builds + runs the `SemanticFieldProcessor` from the config on the write path.
+- SC serves search from the stored mapping's constant `model_id`.
+- OASis pre-provisions the global managed models for supported `(language,
+  model_type)` pairs.
 - **Boundaries:** semantic fields only via CreateIndex (not PutMapping/template);
-  only managed `(language, model_type)` pairs OASis has pre-deployed; up to 10
+  only `(language, model_type)` pairs with pre-provisioned global models; up to 10
   semantic fields per index.
 
 ### Phase 2 — PutMapping / PutTemplate + auto-create
 - Deploy the slim transform module on MD so PutMapping/PutTemplate (which bypass
-  IC) can run the same static expansion and persist the config.
-- Open the MD→OASis network path — required only if/when **non-static** semantic
-  fields (arbitrary customer `model_id`, needing `getModel()`) are supported;
-  managed `(language, model_type)` remains static and OASis-free for resolution
-  even here.
+  IC) run the same static expansion and persist the config locally.
 - Template Resolve API on MD: run the static expansion against the resolved
   template so `systemIngestPipelineConfig` exists **before** the first write into
-  an auto-created index (solves blocking issue #3).
+  an auto-created index.
 
 ---
 
-## 10. Why `providesStaticExpansion()` is the linchpin
+## 11. Why hardcoded model IDs enable Phase 1 without MD→OASis
 
-Everything AOSS-specific above hinges on the managed resolver being *static*:
+This is the key insight of the whole design.
 
-- **No OASis on the metadata write path (Phase 1)** — expansion is constants, so
-  IC (and later MD) never call ML-Commons at CreateIndex/PutMapping.
-- **`systemIngestPipelineConfig` is fully computable at write time** — the model
-  id is a constant, so the config is complete and IC never resolves anything on
-  the hot path.
-- **Same resolver in two homes (IC and MD)** — because it is side-effect-free and
-  deterministic, running it on IC (Phase 1) and MD (Phase 2) yields identical
-  output with no coordination.
-- **Cheap and reliable** — no dependency on ML-Commons availability for
-  create/put; the only runtime OASis dependency is inference, which AOSS already
-  operates for existing neural/K-NN offerings.
+Because `ManagedSemanticModelResolver.resolve()` **returns a hardcoded global
+model ID constant** (a map lookup, not a call to OASis), the semantic expansion
+is a **pure function of the mapping**:
 
-If we ever support non-managed semantic fields in AOSS (customer-supplied
-`model_id` that requires `getModel()`), `providesStaticExpansion()` returns
-false and that path **does** require the MD→OASis connection — which is exactly
-the Phase 2 network work, kept out of the critical path for the managed
-launch.
+- **The transform never calls OASis.** Resolving `(language, model_type)` is a
+  constant lookup, so IC's `SemanticMappingTransformer` completes CreateIndex
+  with no ML-Commons round-trip.
+- **`systemIngestPipelineConfig` is fully computable at write time.** The
+  `model_id` is a constant, so the config is complete the moment CreateIndex runs
+  — nothing is left to resolve later.
+- **The entire CreateIndex + config-extraction path works even though MD has no
+  OASis connectivity.** Neither IC (during transform) nor MD (during extraction)
+  needs to reach OASis, because there is nothing to resolve — only a constant to
+  copy. The single runtime OASis dependency is *inference* at ingest/query time,
+  which AOSS already operates for existing neural / K-NN offerings.
+
+That is exactly what makes Phase 1 deliverable immediately: the hard,
+cross-network MD→OASis work is not on the critical path. If AOSS ever supported
+non-static semantic fields (a customer-supplied `model_id` requiring
+`getModel()`), *that* path would need MD→OASis — but the managed
+`(language, model_type)` case stays constant-only and OASis-free for resolution.
 
 ---
 
-## 11. Open questions / risks
+## 12. Open Questions
 
-1. **Managed model catalog & versioning.** The `(language, model_type) →
-   model_id` map is a constant table in `opensearch-model-provider`. How do we
-   roll a new managed model version without breaking indices whose
-   `systemIngestPipelineConfig` baked in the old id? (Likely: the baked config is
+1. **Global model catalog & versioning.** The `(language, model_type) → model_id`
+   mapping is a constant table inside `ManagedSemanticModelResolver.java`. How do
+   we roll a new managed model version without breaking indices whose
+   `systemIngestPipelineConfig` baked in the old ID? (Likely: the baked config is
    the source of truth for existing indices; new indices pick up the new
-   mapping — but ingest and query must stay on the *same* model id for a given
-   index. Confirm.)
-2. **Config staleness on model rotation.** If a managed model is redeployed at a
-   new id, existing indices keep the old id in their persisted config. Confirm
-   that OASis retains old managed model ids for the lifetime of indices using
-   them, or define a re-materialization story.
-3. **Query/ingest model symmetry.** Ensure SC's query-side managed model id and
-   IC's ingest-side managed model id for the same `(language, model_type)` always
-   agree (dense embeddings must be produced and searched with the same model).
-   Both derive from the same resolver, but they run in different components — a
-   shared constant table in `opensearch-model-provider` is the guarantee.
+   constant — but ingest and query for a given index must stay on the same ID.
+   Confirm.)
+2. **Config staleness on model rotation.** If a global model is re-provisioned at
+   a new ID, existing indices keep the old ID in their persisted config. Confirm
+   OASis retains old global model IDs for the lifetime of indices using them, or
+   define a re-materialization story.
+3. **Query/ingest model symmetry.** SC's query-side and IC's ingest-side
+   `model_id` for the same `(language, model_type)` must always agree (embeddings
+   must be produced and searched with the same model). Both derive from the same
+   `ManagedSemanticModelResolver` constant table in the shared managed source
+   fork — that shared table is the guarantee, but confirm both components vendor
+   the same fork revision.
 4. **PhysicalIndex rollover.** On rollover (time-series / size), confirm the new
    PhysicalIndex inherits `systemIngestPipelineConfig` (the extraction layer must
    copy it forward, analogous to how shard config is carried forward on warm
    transition).
-5. **GET mapping fidelity.** Confirm `language`/`model_type` round-trip
-   unchanged in the GET mapping response (MD's delegating mapper must serialize
-   the new params in `toXContent`).
+5. **GET mapping fidelity.** Confirm `language`/`model_type` round-trip unchanged
+   in the GET mapping response (MD's delegating mapper must serialize the new
+   params in `toXContent`).
+6. **AutoSync patch stability.** The managed fork carries exactly one patch file
+   (`ManagedSemanticModelResolver.java`) + a one-line swap in
+   `NeuralSearch.getMappingTransformers()`. Confirm AutoSync conflict surface
+   stays minimal as OSS neural-search evolves the `SemanticModelResolver`
+   interface — the one-line swap is the only OSS-file touch and must track any
+   `getMappingTransformers()` signature change.

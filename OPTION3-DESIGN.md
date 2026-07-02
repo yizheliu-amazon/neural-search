@@ -171,6 +171,7 @@ This means:
 | Memory overhead | ~14KB | Zero | Zero |
 | Build pipeline | New package to build/deploy | Same package | Same package (patch applied at build time) |
 | **model_id optional (ASE to OSS)** | No — ASE logic stays in closed-source plugin; OSS still requires model_id | Partially — logic in OSS but mixed with AWS specifics | **Yes — SemanticModelResolver + language/model_type are fully in OSS. OSS users can use semantic field without providing model_id (resolved to pretrained model automatically). This upstreams the ASE "no model_id needed" experience to open-source.** |
+| **Feature ownership** | Fragmented — ASE is an enhancement of neural-search's semantic field, but lives in a separate plugin. Bug triage spans two plugins interacting at MappingTransformer level. Not a new product, doesn't warrant a new plugin. | Unified — all in one place | Unified — enhancement lives where the feature lives (neural-search). Managed patch is just a policy swap, not a separate product. |
 
 ## Validation Rules (handled in OSS, shared by both resolvers)
 
