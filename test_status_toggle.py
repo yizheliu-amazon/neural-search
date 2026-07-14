@@ -343,6 +343,107 @@ def print_summary():
     print("    Stage 4 (RE-ENABLED):  YES embeddings ✅")
 
 
+def test_get_mapping_preservation():
+    """Test that GET mapping returns correct params at each status toggle."""
+    print("\n" + "=" * 70)
+    print("GET MAPPING TEST: Verify params preserved across status toggles")
+    print("=" * 70)
+
+    GET_INDEX = "test-getmapping"
+
+    # Cleanup
+    try:
+        client.indices.delete(index=GET_INDEX, ignore=[404])
+    except Exception:
+        pass
+
+    # Step 1: Create with DISABLED + explicit params
+    print("\n>>> Step 1: Create with status=DISABLED, language=ENGLISH, model_type=SPARSE")
+    create_body = {
+        "mappings": {
+            "properties": {
+                "title": {
+                    "type": "semantic",
+                    "status": "DISABLED",
+                    "language": "ENGLISH",
+                    "model_type": "SPARSE"
+                }
+            }
+        }
+    }
+    print_curl("PUT", f"/{GET_INDEX}", create_body)
+    client.indices.create(index=GET_INDEX, body=create_body)
+
+    print_curl("GET", f"/{GET_INDEX}/_mapping")
+    mapping = client.indices.get_mapping(index=GET_INDEX)
+    content = mapping[GET_INDEX]["mappings"]["properties"]["title"]
+    print(f"    Response: {json.dumps(content, indent=4)}")
+    assert content.get("type") == "semantic"
+    assert content.get("status") == "DISABLED"
+    assert content.get("language") == "ENGLISH"
+    assert content.get("model_type") == "SPARSE"
+    assert content.get("model_id") is None
+    assert "title_semantic_info" not in mapping[GET_INDEX]["mappings"]["properties"]
+    print("    ✅ DISABLED: correct params, no model_id, no companion field")
+
+    # Step 2: Enable (only specify status)
+    print("\n>>> Step 2: PutMapping status=ENABLED (only status specified)")
+    put_body = {"properties": {"title": {"type": "semantic", "status": "ENABLED"}}}
+    print_curl("PUT", f"/{GET_INDEX}/_mapping", put_body)
+    client.indices.put_mapping(index=GET_INDEX, body=put_body)
+    time.sleep(5)
+
+    print_curl("GET", f"/{GET_INDEX}/_mapping")
+    mapping = client.indices.get_mapping(index=GET_INDEX)
+    content = mapping[GET_INDEX]["mappings"]["properties"]["title"]
+    print(f"    Response: {json.dumps(content, indent=4)}")
+    assert content.get("type") == "semantic"
+    assert content.get("model_id") is not None, "model_id should be resolved"
+    assert content.get("language") == "ENGLISH", f"language lost! Got: {content.get('language')}"
+    assert content.get("model_type") == "SPARSE", f"model_type lost! Got: {content.get('model_type')}"
+    assert "title_semantic_info" in mapping[GET_INDEX]["mappings"]["properties"]
+    original_model_id = content.get("model_id")
+    print(f"    ✅ ENABLED: model_id={original_model_id}, language/model_type preserved, companion created")
+
+    # Step 3: Disable (only specify status)
+    print("\n>>> Step 3: PutMapping status=DISABLED (only status specified)")
+    put_body = {"properties": {"title": {"type": "semantic", "status": "DISABLED"}}}
+    print_curl("PUT", f"/{GET_INDEX}/_mapping", put_body)
+    client.indices.put_mapping(index=GET_INDEX, body=put_body)
+
+    print_curl("GET", f"/{GET_INDEX}/_mapping")
+    mapping = client.indices.get_mapping(index=GET_INDEX)
+    content = mapping[GET_INDEX]["mappings"]["properties"]["title"]
+    print(f"    Response: {json.dumps(content, indent=4)}")
+    assert content.get("type") == "semantic"
+    assert content.get("status") == "DISABLED"
+    assert content.get("model_id") == original_model_id, f"model_id should be preserved! Got: {content.get('model_id')}"
+    assert content.get("language") == "ENGLISH", f"language should be preserved! Got: {content.get('language')}"
+    assert content.get("model_type") == "SPARSE", f"model_type should be preserved! Got: {content.get('model_type')}"
+    # Companion field stays in mapping (append-only)
+    assert "title_semantic_info" in mapping[GET_INDEX]["mappings"]["properties"]
+    print(f"    ✅ DISABLED: model_id/language/model_type ALL preserved, companion still in mapping")
+
+    # Step 4: Re-enable (only specify status)
+    print("\n>>> Step 4: PutMapping status=ENABLED (only status specified)")
+    put_body = {"properties": {"title": {"type": "semantic", "status": "ENABLED"}}}
+    print_curl("PUT", f"/{GET_INDEX}/_mapping", put_body)
+    client.indices.put_mapping(index=GET_INDEX, body=put_body)
+
+    print_curl("GET", f"/{GET_INDEX}/_mapping")
+    mapping = client.indices.get_mapping(index=GET_INDEX)
+    content = mapping[GET_INDEX]["mappings"]["properties"]["title"]
+    print(f"    Response: {json.dumps(content, indent=4)}")
+    assert content.get("type") == "semantic"
+    assert content.get("model_id") == original_model_id, f"model_id should be preserved! Got: {content.get('model_id')}"
+    assert content.get("language") == "ENGLISH", f"language should be preserved! Got: {content.get('language')}"
+    assert content.get("model_type") == "SPARSE", f"model_type should be preserved! Got: {content.get('model_type')}"
+    assert content.get("status") in (None, "ENABLED")
+    print(f"    ✅ RE-ENABLED: model_id/language/model_type ALL preserved")
+
+    print("\n    ✅ GET MAPPING TEST PASSED — all params preserved across all toggles")
+
+
 def main():
     print("=" * 70)
     print("ASE Status Toggle E2E Test")
@@ -381,6 +482,9 @@ def main():
     stage3_disable()
     stage4_reenable(model_id)
     print_summary()
+
+    # Run GET mapping preservation test
+    test_get_mapping_preservation()
 
     print("\n" + "=" * 70)
     print("ALL TESTS PASSED ✅")
