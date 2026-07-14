@@ -52,7 +52,7 @@ import static org.opensearch.neuralsearch.constants.SemanticFieldConstants.SPARS
  */
 public class SemanticFieldMapper extends ParametrizedFieldMapper {
     public static final String CONTENT_TYPE = "semantic";
-    private final SemanticParameters semanticParameters;
+    private SemanticParameters semanticParameters;
 
     @Setter
     @Getter
@@ -100,7 +100,55 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 throw new IllegalArgumentException(err, e);
             }
         }
-        return super.merge(mergeWith);
+        ParametrizedFieldMapper merged = super.merge(mergeWith);
+        // Preserve system-managed parameters that should not be lost on partial PutMapping updates.
+        // When customer only specifies status change, incoming mapper has null for model_id/language/model_type.
+        // The Parameter merge framework overwrites with null. Restore from existing mapper.
+        if (merged instanceof SemanticFieldMapper mergedSemantic) {
+            preserveExistingParams(mergedSemantic);
+        }
+        return merged;
+    }
+
+    private void preserveExistingParams(SemanticFieldMapper merged) {
+        SemanticParameters existing = this.semanticParameters;
+        SemanticParameters mergedParams = merged.semanticParameters;
+        if (mergedParams.getModelId() == null && existing.getModelId() != null) {
+            merged.semanticParameters = SemanticParameters.builder()
+                .modelId(existing.getModelId())
+                .searchModelId(mergedParams.getSearchModelId() != null ? mergedParams.getSearchModelId() : existing.getSearchModelId())
+                .rawFieldType(mergedParams.getRawFieldType() != null ? mergedParams.getRawFieldType() : existing.getRawFieldType())
+                .semanticInfoFieldName(
+                    mergedParams.getSemanticInfoFieldName() != null
+                        ? mergedParams.getSemanticInfoFieldName()
+                        : existing.getSemanticInfoFieldName()
+                )
+                .chunkingConfig(mergedParams.getChunkingConfig() != null ? mergedParams.getChunkingConfig() : existing.getChunkingConfig())
+                .semanticFieldSearchAnalyzer(
+                    mergedParams.getSemanticFieldSearchAnalyzer() != null
+                        ? mergedParams.getSemanticFieldSearchAnalyzer()
+                        : existing.getSemanticFieldSearchAnalyzer()
+                )
+                .denseEmbeddingConfig(
+                    mergedParams.getDenseEmbeddingConfig() != null
+                        ? mergedParams.getDenseEmbeddingConfig()
+                        : existing.getDenseEmbeddingConfig()
+                )
+                .sparseEncodingConfig(
+                    mergedParams.getSparseEncodingConfig() != null
+                        ? mergedParams.getSparseEncodingConfig()
+                        : existing.getSparseEncodingConfig()
+                )
+                .skipExistingEmbedding(
+                    mergedParams.getSkipExistingEmbedding() != null
+                        ? mergedParams.getSkipExistingEmbedding()
+                        : existing.getSkipExistingEmbedding()
+                )
+                .language(mergedParams.getLanguage() != null ? mergedParams.getLanguage() : existing.getLanguage())
+                .modelType(mergedParams.getModelType() != null ? mergedParams.getModelType() : existing.getModelType())
+                .status(mergedParams.getStatus() != null ? mergedParams.getStatus() : existing.getStatus())
+                .build();
+        }
     }
 
     @Override
