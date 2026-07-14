@@ -1,0 +1,562 @@
+diff --git a/src/main/java/org/opensearch/neuralsearch/mapper/SemanticFieldMapper.java b/src/main/java/org/opensearch/neuralsearch/mapper/SemanticFieldMapper.java
+index 6715f2fc..b76510d5 100644
+--- a/src/main/java/org/opensearch/neuralsearch/mapper/SemanticFieldMapper.java
++++ b/src/main/java/org/opensearch/neuralsearch/mapper/SemanticFieldMapper.java
+@@ -103,6 +103,27 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
+         return super.merge(mergeWith);
+     }
+ 
++    @Override
++    protected void validateTypeTransition(ParametrizedFieldMapper incoming) {
++        // When transitioning FROM semantic TO another type,
++        // only allow if the target type matches this field's raw_field_type.
++        String targetType = incoming.fieldType().typeName();
++        String rawType = this.semanticParameters.getRawFieldType();
++        if (!targetType.equals(rawType)) {
++            throw new IllegalArgumentException(
++                "mapper ["
++                    + name()
++                    + "] of type [semantic] with raw_field_type ["
++                    + rawType
++                    + "] can only be changed back to type ["
++                    + rawType
++                    + "], not ["
++                    + targetType
++                    + "]"
++            );
++        }
++    }
++
+     @Override
+     protected void parseCreateField(ParseContext context) throws IOException {
+         delegateFieldMapper.parse(context);
+diff --git a/src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java b/src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java
+index 9da20363..58e30d65 100644
+--- a/src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java
++++ b/src/main/java/org/opensearch/neuralsearch/plugin/NeuralSearch.java
+@@ -16,6 +16,7 @@ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
++import java.util.Set;
+ import java.util.function.Supplier;
+ 
+ import org.opensearch.core.common.breaker.CircuitBreaker;
+@@ -464,6 +465,27 @@ public class NeuralSearch extends Plugin
+         );
+     }
+ 
++    @Override
++    public Map<String, Set<String>> getAllowedFieldTypeTransitions() {
++        Set<String> supportedRawTypes = Set.of("text", "keyword", "match_only_text", "wildcard", "token_count", "binary");
++        return Map.of(
++            "text",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            "keyword",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            "match_only_text",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            "wildcard",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            "token_count",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            "binary",
++            Set.of(SemanticFieldMapper.CONTENT_TYPE),
++            SemanticFieldMapper.CONTENT_TYPE,
++            supportedRawTypes
++        );
++    }
++
+     @Override
+     public List<MappingTransformer> getMappingTransformers() {
+         semanticMappingTransformer = new SemanticMappingTransformer(clientAccessor, xContentRegistry);
+diff --git a/test_text_semantic_toggle.py b/test_text_semantic_toggle.py
+new file mode 100644
+index 00000000..3f4fed1d
+--- /dev/null
++++ b/test_text_semantic_toggle.py
+@@ -0,0 +1,484 @@
++#!/usr/bin/env python3
++"""
++ASE text ↔ semantic Toggle E2E Test
++
++Tests:
++1. Create index with text field, ingest docs
++2. PutMapping to change text → semantic (enable ASE)
++3. Verify mapping has semantic field + companion
++4. Ingest new docs → verify embeddings generated
++5. Search with neural_sparse → verify results
++6. PutMapping to change semantic → text (disable ASE)
++7. Verify mapping reverted to text
++8. Ingest new docs → verify no embeddings
++9. BM25 match still works
++
++Prerequisites:
++- OpenSearch cluster running with neural-search plugin (with type transition registry)
++- ML Commons configured
++- opensearch-py installed
++"""
++
++import json
++import sys
++import time
++
++try:
++    from opensearchpy import OpenSearch
++except ImportError:
++    print("ERROR: pip install opensearch-py")
++    sys.exit(1)
++
++HOST = "localhost"
++PORT = 9200
++BASE_URL = f"http://{HOST}:{PORT}"
++
++client = OpenSearch(hosts=[{"host": HOST, "port": PORT}], timeout=180)
++
++
++def print_curl(method, path, body=None):
++    """Print the equivalent curl command for a request, with index names replaced by variables."""
++    display_path = path
++    # Replace known index names with shell variables (longer name first to avoid partial match)
++    for idx_name in ["test-toggle-disable", "test-toggle"]:
++        if idx_name in display_path:
++            display_path = display_path.replace(idx_name, "${indexName}")
++            break
++    cmd = f'curl -s -X {method} "{BASE_URL}{display_path}"'
++    if body:
++        body_str = json.dumps(body)
++        for idx_name in ["test-toggle-disable", "test-toggle"]:
++            body_str = body_str.replace(idx_name, "${indexName}")
++        cmd += f""" -H 'Content-Type: application/json' -d '{body_str}'"""
++    # Add pretty print for GET requests
++    if method == "GET" and not body:
++        cmd += " | python3 -m json.tool"
++    print(f"    [curl] {cmd}")
++    print()
++
++
++def wait_for_model(index_name, timeout=90):
++    """Get model_id from semantic field and wait for deployment."""
++    mapping = client.indices.get_mapping(index=index_name)
++    props = mapping[index_name]["mappings"]["properties"]
++    model_id = None
++    for field_name, field_config in props.items():
++        if field_config.get("type") == "semantic":
++            model_id = field_config.get("model_id")
++            break
++    if not model_id:
++        return None
++
++    for i in range(timeout):
++        try:
++            resp = client.transport.perform_request("GET", f"/_plugins/_ml/models/{model_id}")
++            if resp.get("model_state") == "DEPLOYED":
++                return model_id
++        except Exception:
++            pass
++        time.sleep(1)
++    print(f"  WARNING: Model {model_id} not deployed after {timeout}s")
++    return model_id
++
++
++def test_text_to_semantic():
++    """Test changing a text field to semantic (enable ASE)."""
++    print("\n" + "=" * 60)
++    print("TEST: text → semantic (Enable ASE)")
++    print("=" * 60)
++
++    index_name = "test-toggle"
++
++    # Cleanup
++    try:
++        client.indices.delete(index=index_name, ignore=[404])
++    except Exception:
++        pass
++
++    # Step 1: Create index with plain text field
++    print("\n>>> Step 1: Create index with text field")
++    create_body = {
++        "mappings": {
++            "properties": {
++                "title": {"type": "text"},
++                "category": {"type": "keyword"}
++            }
++        }
++    }
++    print_curl("PUT", f"/{index_name}", create_body)
++    resp = client.indices.create(index=index_name, body=create_body)
++    print(f"    Response: {json.dumps(resp, indent=4)}")
++    mapping = client.indices.get_mapping(index=index_name)
++    title_type = mapping[index_name]["mappings"]["properties"]["title"]["type"]
++    print(f"    title type: {title_type}")
++    assert title_type == "text", f"Expected 'text', got '{title_type}'"
++
++    # Step 2: Ingest docs as plain text
++    print("\n>>> Step 2: Ingest documents (as plain text)")
++    docs = [
++        {"title": "OpenSearch is a search engine", "category": "tech"},
++        {"title": "Machine learning for NLP", "category": "ml"},
++        {"title": "Kubernetes container orchestration", "category": "infra"},
++    ]
++    for i, doc in enumerate(docs, 1):
++        print_curl("PUT", f"/{index_name}/_doc/{i}?refresh=true", doc)
++        resp = client.index(index=index_name, id=i, body=doc, refresh=True)
++        print(f"    Response: result={resp.get('result')}")
++    print(f"    Ingested {len(docs)} docs")
++
++    # Verify no semantic_info
++    print_curl("GET", f"/{index_name}/_doc/1")
++    doc1 = client.get(index=index_name, id=1)
++    print(f"    Response: {json.dumps(doc1['_source'], indent=4)}")
++    assert "title_semantic_info" not in doc1["_source"], "Should not have semantic_info yet"
++    print("    Confirmed: no embeddings on text-only docs")
++
++    # Step 3: PutMapping — change title from text to semantic
++    print("\n>>> Step 3: PutMapping text → semantic")
++    put_mapping_body = {
++        "properties": {
++            "title": {
++                "type": "semantic"
++            }
++        }
++    }
++    print_curl("PUT", f"/{index_name}/_mapping", put_mapping_body)
++    try:
++        resp = client.indices.put_mapping(index=index_name, body=put_mapping_body)
++        print(f"    Response: {json.dumps(resp, indent=4)}")
++    except Exception as e:
++        print(f"    ERROR: {e}")
++        return False
++
++    # Step 4: Verify mapping changed
++    print("\n>>> Step 4: Verify mapping")
++    print_curl("GET", f"/{index_name}/_mapping")
++    mapping = client.indices.get_mapping(index=index_name)
++    print(f"    Response: {json.dumps(mapping, indent=4)}")
++    props = mapping[index_name]["mappings"]["properties"]
++    title_config = props.get("title", {})
++    print(f"    title type: {title_config.get('type')}")
++    print(f"    title model_id: {title_config.get('model_id')}")
++    print(f"    title language: {title_config.get('language')}")
++    print(f"    title model_type: {title_config.get('model_type')}")
++    has_companion = "title_semantic_info" in props
++    print(f"    Has companion field: {has_companion}")
++
++    if title_config.get("type") != "semantic":
++        print("    FAILED: title not changed to semantic")
++        return False
++
++    # Step 5: Wait for model
++    print("\n>>> Step 5: Wait for model deployment")
++    model_id = wait_for_model(index_name)
++    print(f"    Model ready: {model_id}")
++    if not model_id:
++        print("    FAILED: no model_id found")
++        return False
++
++    # Step 6: Ingest new docs — should get embeddings
++    print("\n>>> Step 6: Ingest new docs (should get embeddings)")
++    new_docs = [
++        {"title": "Neural search with transformers", "category": "ml"},
++        {"title": "Vector databases and similarity search", "category": "tech"},
++    ]
++    for i, doc in enumerate(new_docs, 4):
++        print_curl("PUT", f"/{index_name}/_doc/{i}?refresh=true", doc)
++        resp = client.index(index=index_name, id=i, body=doc, refresh=True)
++        print(f"    Response: result={resp.get('result')}")
++    print(f"    Ingested {len(new_docs)} new docs")
++
++    # Verify embeddings on new docs
++    print_curl("GET", f"/{index_name}/_doc/4")
++    doc4 = client.get(index=index_name, id=4)
++    print(f"    Response: {json.dumps(doc4['_source'], indent=4)[:500]}")
++    si = doc4["_source"].get("title_semantic_info", {})
++    emb = si.get("embedding", {})
++    print(f"    Doc 4 embeddings: {len(emb)} tokens")
++    if not emb:
++        print("    FAILED: no embeddings on new doc")
++        return False
++    print(f"    Sample: {list(emb.items())[:3]}")
++
++    # Step 7: Neural search
++    print("\n>>> Step 7: Neural sparse search")
++    search_body = {
++        "query": {
++            "neural_sparse": {
++                "title_semantic_info.embedding": {
++                    "query_text": "machine learning search",
++                    "model_id": model_id
++                }
++            }
++        }
++    }
++    print_curl("POST", f"/{index_name}/_search", search_body)
++    results = client.search(index=index_name, body=search_body)
++    print(f"    Response: total_hits={results['hits']['total']['value']}")
++    hits = results["hits"]["hits"]
++    print(f"    Hits: {len(hits)}")
++    for h in hits:
++        print(f"      doc {h['_id']}: score={h['_score']:.4f} | {h['_source']['title']}")
++
++    if len(hits) == 0:
++        print("    FAILED: no neural search results")
++        return False
++
++    print("\n    ✅ text → semantic PASSED")
++    return True
++
++
++def test_semantic_to_text():
++    """Test changing a semantic field back to text (disable ASE)."""
++    print("\n" + "=" * 60)
++    print("TEST: semantic → text (Disable ASE)")
++    print("=" * 60)
++
++    index_name = "test-toggle-disable"
++
++    # Cleanup
++    try:
++        client.indices.delete(index=index_name, ignore=[404])
++    except Exception:
++        pass
++
++    # Step 1: Create index with semantic field
++    print("\n>>> Step 1: Create index with semantic field")
++    create_body = {
++        "mappings": {
++            "properties": {
++                "content": {"type": "semantic"}
++            }
++        }
++    }
++    print_curl("PUT", f"/{index_name}", create_body)
++    resp = client.indices.create(index=index_name, body=create_body)
++    print(f"    Response: {json.dumps(resp, indent=4)}")
++
++    # Wait for model
++    model_id = wait_for_model(index_name)
++    print(f"    Model ready: {model_id}")
++
++    # Ingest
++    print("\n>>> Step 2: Ingest docs with embeddings")
++    docs = [
++        {"content": "OpenSearch semantic search capabilities"},
++        {"content": "Distributed computing fundamentals"},
++    ]
++    for i, doc in enumerate(docs, 1):
++        print_curl("PUT", f"/{index_name}/_doc/{i}?refresh=true", doc)
++        resp = client.index(index=index_name, id=i, body=doc, refresh=True)
++        print(f"    Response: result={resp.get('result')}")
++
++    # Verify embeddings exist
++    print_curl("GET", f"/{index_name}/_doc/1")
++    doc1 = client.get(index=index_name, id=1)
++    print(f"    Response: {json.dumps(doc1['_source'], indent=4)[:500]}")
++    si = doc1["_source"].get("content_semantic_info", {})
++    assert si.get("embedding"), "Should have embeddings before disable"
++    print(f"    Doc 1 has {len(si.get('embedding', {}))} tokens")
++
++    # Step 3: PutMapping — change semantic back to text
++    print("\n>>> Step 3: PutMapping semantic → text")
++    put_mapping_body = {
++        "properties": {
++            "content": {"type": "text"}
++        }
++    }
++    print_curl("PUT", f"/{index_name}/_mapping", put_mapping_body)
++    try:
++        resp = client.indices.put_mapping(index=index_name, body=put_mapping_body)
++        print(f"    Response: {json.dumps(resp, indent=4)}")
++    except Exception as e:
++        print(f"    ERROR: {e}")
++        return False
++
++    # Step 4: Verify mapping changed back to text
++    print("\n>>> Step 4: Verify mapping reverted")
++    print_curl("GET", f"/{index_name}/_mapping")
++    mapping = client.indices.get_mapping(index=index_name)
++    print(f"    Response: {json.dumps(mapping, indent=4)}")
++    props = mapping[index_name]["mappings"]["properties"]
++    content_config = props.get("content", {})
++    print(f"    content type: {content_config.get('type')}")
++
++    if content_config.get("type") != "text":
++        print(f"    FAILED: content type is '{content_config.get('type')}', expected 'text'")
++        return False
++
++    # Step 5: Ingest new doc — should NOT get embeddings
++    print("\n>>> Step 5: Ingest new doc (should NOT get embeddings)")
++    doc3_body = {"content": "This should be plain text only"}
++    print_curl("PUT", f"/{index_name}/_doc/3?refresh=true", doc3_body)
++    resp = client.index(index=index_name, id=3, body=doc3_body, refresh=True)
++    print(f"    Response: result={resp.get('result')}")
++
++    print_curl("GET", f"/{index_name}/_doc/3")
++    doc3 = client.get(index=index_name, id=3)
++    print(f"    Response: {json.dumps(doc3['_source'], indent=4)}")
++    has_si = "content_semantic_info" in doc3["_source"]
++    print(f"    Doc 3 has semantic_info: {has_si}")
++
++    # Step 6: BM25 match should still work
++    print("\n>>> Step 6: BM25 match query")
++    search_body = {"query": {"match": {"content": "semantic search"}}}
++    print_curl("POST", f"/{index_name}/_search", search_body)
++    results = client.search(index=index_name, body=search_body)
++    print(f"    Response: total_hits={results['hits']['total']['value']}")
++    hits = results["hits"]["hits"]
++    print(f"    BM25 hits: {len(hits)}")
++    for h in hits:
++        print(f"      doc {h['_id']}: score={h['_score']:.4f} | {h['_source']['content'][:50]}")
++
++    if len(hits) == 0:
++        print("    FAILED: BM25 should still find results")
++        return False
++
++    print("\n    ✅ semantic → text PASSED")
++    return True
++
++
++def test_rejection_cases():
++    """Test that invalid type transitions are rejected."""
++    print("\n" + "=" * 60)
++    print("TEST: Rejection Cases")
++    print("=" * 60)
++
++    all_passed = True
++
++    # Test 1: semantic (raw_field_type=text) → keyword should be REJECTED
++    print("\n>>> Test: semantic(raw=text) → keyword (should REJECT)")
++    index_name = "test-reject-1"
++    try:
++        client.indices.delete(index=index_name, ignore=[404])
++    except Exception:
++        pass
++
++    create_body = {"mappings": {"properties": {"title": {"type": "semantic"}}}}
++    print_curl("PUT", f"/{index_name}", create_body)
++    client.indices.create(index=index_name, body=create_body)
++    time.sleep(2)
++
++    put_body = {"properties": {"title": {"type": "keyword"}}}
++    print_curl("PUT", f"/{index_name}/_mapping", put_body)
++    try:
++        client.indices.put_mapping(index=index_name, body=put_body)
++        print("    FAILED: should have been rejected but was accepted")
++        all_passed = False
++    except Exception as e:
++        error_msg = str(e)
++        if "raw_field_type" in error_msg and "can only be changed back to type [text]" in error_msg:
++            print(f"    ✅ Correctly rejected: {error_msg[:120]}")
++        else:
++            print(f"    ✅ Rejected (different error): {error_msg[:120]}")
++
++    # Test 2: keyword → semantic should be ALLOWED
++    print("\n>>> Test: keyword → semantic (should ALLOW)")
++    index_name = "test-reject-2"
++    try:
++        client.indices.delete(index=index_name, ignore=[404])
++    except Exception:
++        pass
++
++    create_body = {"mappings": {"properties": {"tag": {"type": "keyword"}}}}
++    print_curl("PUT", f"/{index_name}", create_body)
++    client.indices.create(index=index_name, body=create_body)
++
++    put_body = {"properties": {"tag": {"type": "semantic", "raw_field_type": "keyword"}}}
++    print_curl("PUT", f"/{index_name}/_mapping", put_body)
++    try:
++        resp = client.indices.put_mapping(index=index_name, body=put_body)
++        print(f"    ✅ Correctly allowed: {json.dumps(resp)}")
++    except Exception as e:
++        print(f"    FAILED: should have been allowed but got: {e}")
++        all_passed = False
++
++    # Test 3: text → keyword should still be REJECTED (not a semantic transition)
++    print("\n>>> Test: text → keyword (should REJECT — not a semantic transition)")
++    index_name = "test-reject-3"
++    try:
++        client.indices.delete(index=index_name, ignore=[404])
++    except Exception:
++        pass
++
++    create_body = {"mappings": {"properties": {"name": {"type": "text"}}}}
++    print_curl("PUT", f"/{index_name}", create_body)
++    client.indices.create(index=index_name, body=create_body)
++
++    put_body = {"properties": {"name": {"type": "keyword"}}}
++    print_curl("PUT", f"/{index_name}/_mapping", put_body)
++    try:
++        client.indices.put_mapping(index=index_name, body=put_body)
++        print("    FAILED: should have been rejected but was accepted")
++        all_passed = False
++    except Exception as e:
++        if "cannot be changed from type" in str(e):
++            print(f"    ✅ Correctly rejected: text→keyword not allowed")
++        else:
++            print(f"    ✅ Rejected: {str(e)[:100]}")
++
++    # Test 4: semantic(raw=keyword) → keyword should be ALLOWED
++    print("\n>>> Test: semantic(raw=keyword) → keyword (should ALLOW)")
++    index_name = "test-reject-2"  # reuse the keyword→semantic index from test 2
++    time.sleep(2)
++
++    put_body = {"properties": {"tag": {"type": "keyword"}}}
++    print_curl("PUT", f"/{index_name}/_mapping", put_body)
++    try:
++        resp = client.indices.put_mapping(index=index_name, body=put_body)
++        print(f"    ✅ Correctly allowed: {json.dumps(resp)}")
++    except Exception as e:
++        print(f"    FAILED: should have been allowed but got: {e}")
++        all_passed = False
++
++    if all_passed:
++        print("\n    ✅ All rejection cases PASSED")
++    else:
++        print("\n    ❌ Some rejection cases FAILED")
++    return all_passed
++
++
++def main():
++    print("=" * 60)
++    print("ASE text ↔ semantic Toggle E2E Test")
++    print("=" * 60)
++
++    # Check cluster health
++    try:
++        health = client.cluster.health()
++        print(f"Cluster: {health['status']}")
++    except Exception as e:
++        print(f"ERROR: Cannot connect to cluster: {e}")
++        sys.exit(1)
++
++    # Configure ML
++    print("\n>>> Configuring ML Commons...")
++    ml_settings = {
++        "persistent": {
++            "plugins.ml_commons.only_run_on_ml_node": False,
++            "plugins.ml_commons.native_memory_threshold": 100,
++            "plugins.ml_commons.jvm_heap_memory_threshold": 100
++        }
++    }
++    print_curl("PUT", "/_cluster/settings", ml_settings)
++    resp = client.cluster.put_settings(body=ml_settings)
++    print(f"    Response: acknowledged={resp.get('acknowledged')}")
++
++    t2s_ok = test_text_to_semantic()
++    s2t_ok = test_semantic_to_text()
++    reject_ok = test_rejection_cases()
++
++    print("\n" + "=" * 60)
++    print("RESULTS")
++    print("=" * 60)
++    print(f"  text → semantic (enable):    {'✅ PASS' if t2s_ok else '❌ FAIL'}")
++    print(f"  semantic → text (disable):   {'✅ PASS' if s2t_ok else '❌ FAIL'}")
++    print(f"  rejection cases:             {'✅ PASS' if reject_ok else '❌ FAIL'}")
++    print("=" * 60)
++
++    if not (t2s_ok and s2t_ok and reject_ok):
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()

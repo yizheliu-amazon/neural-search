@@ -1,0 +1,244 @@
+From f2c1cbb997bf2d50227c3f94a2c4b14c7e083b48 Mon Sep 17 00:00:00 2001
+From: Yizhe Liu <yizheliu@amazon.com>
+Date: Thu, 9 Jul 2026 14:47:19 -0700
+Subject: [PATCH] Add plugin-extensible field type transition registry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allow plugins to declare permitted field type transitions via a new
+MapperPlugin.getAllowedFieldTypeTransitions() SPI. Core checks this
+registry in ParametrizedFieldMapper.merge() before throwing the
+"mapper cannot be changed from type X to Y" error.
+
+Also adds a validateTypeTransition() hook that the existing mapper can
+override to reject specific transitions based on its own state (e.g.,
+SemanticFieldMapper rejects reverting to a type that doesn't match its
+raw_field_type).
+
+Changes:
+- MapperPlugin.java: new default getAllowedFieldTypeTransitions() method
+- MapperRegistry.java: stores transitions, isTransitionAllowed() helper
+- IndicesModule.java: aggregates from plugins, populates static registry
+- ParametrizedFieldMapper.java: static registry, check before throw,
+  validateTypeTransition() hook
+
+No FieldMapper.java change needed — all relevant mappers (text, keyword,
+match_only_text, wildcard, token_count, binary, semantic) extend
+ParametrizedFieldMapper.
+---
+ .../index/mapper/ParametrizedFieldMapper.java | 43 +++++++++++++++++++
+ .../org/opensearch/indices/IndicesModule.java | 18 +++++++-
+ .../indices/mapper/MapperRegistry.java        | 28 ++++++++++++
+ .../org/opensearch/plugins/MapperPlugin.java  | 13 ++++++
+ 4 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/server/src/main/java/org/opensearch/index/mapper/ParametrizedFieldMapper.java b/server/src/main/java/org/opensearch/index/mapper/ParametrizedFieldMapper.java
+index 927e5ba90fe..4452f01acf2 100644
+--- a/server/src/main/java/org/opensearch/index/mapper/ParametrizedFieldMapper.java
++++ b/server/src/main/java/org/opensearch/index/mapper/ParametrizedFieldMapper.java
+@@ -79,6 +79,39 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
+ 
+     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(ParametrizedFieldMapper.class);
+ 
++    /**
++     * Registry of allowed field type transitions, populated at node startup from plugin declarations.
++     * Maps source type to the set of target types that the source is allowed to transition to.
++     */
++    private static volatile Map<String, Set<String>> ALLOWED_TYPE_TRANSITIONS = Collections.emptyMap();
++
++    /**
++     * Sets the allowed type transitions registry. Called once during node initialization.
++     */
++    public static void setAllowedTypeTransitions(Map<String, Set<String>> transitions) {
++        ALLOWED_TYPE_TRANSITIONS = transitions;
++    }
++
++    /**
++     * Returns true if a field type transition from {@code fromType} to {@code toType} is allowed.
++     */
++    static boolean isTypeTransitionAllowed(String fromType, String toType) {
++        Set<String> allowed = ALLOWED_TYPE_TRANSITIONS.get(fromType);
++        return allowed != null && allowed.contains(toType);
++    }
++
++    /**
++     * Called when a type transition is allowed by the registry, giving the existing mapper
++     * a chance to reject the transition based on its own state. Override in subclasses to
++     * add validation (e.g., semantic field verifying raw_field_type matches the target).
++     *
++     * @param incoming the incoming mapper that will replace this one
++     * @throws IllegalArgumentException if the transition should be rejected
++     */
++    protected void validateTypeTransition(ParametrizedFieldMapper incoming) {
++        // Default: no additional validation. Subclasses override to add checks.
++    }
++
+     /**
+      * Creates a new ParametrizedFieldMapper
+      */
+@@ -110,11 +143,21 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
+         }
+         String mergeWithContentType = ((FieldMapper) mergeWith).contentType();
+         if (Objects.equals(this.getClass(), mergeWith.getClass()) == false) {
++            // Check if this type transition is allowed by a registered plugin
++            if (isTypeTransitionAllowed(contentType(), mergeWithContentType)) {
++                validateTypeTransition((ParametrizedFieldMapper) mergeWith);
++                return (ParametrizedFieldMapper) mergeWith;
++            }
+             throw new IllegalArgumentException(
+                 "mapper [" + name() + "] cannot be changed from type [" + contentType() + "] to [" + mergeWithContentType + "]"
+             );
+         }
+         if (Objects.equals(contentType(), mergeWithContentType) == false) {
++            // Check if this type transition is allowed by a registered plugin
++            if (isTypeTransitionAllowed(contentType(), mergeWithContentType)) {
++                validateTypeTransition((ParametrizedFieldMapper) mergeWith);
++                return (ParametrizedFieldMapper) mergeWith;
++            }
+             throw new IllegalArgumentException(
+                 "mapper [" + name() + "] cannot be changed from type [" + contentType() + "] to [" + mergeWithContentType + "]"
+             );
+diff --git a/server/src/main/java/org/opensearch/indices/IndicesModule.java b/server/src/main/java/org/opensearch/indices/IndicesModule.java
+index 2cd06493e82..22622b2d9ea 100644
+--- a/server/src/main/java/org/opensearch/indices/IndicesModule.java
++++ b/server/src/main/java/org/opensearch/indices/IndicesModule.java
+@@ -66,6 +66,7 @@ import org.opensearch.index.mapper.MetadataFieldMapper;
+ import org.opensearch.index.mapper.NestedPathFieldMapper;
+ import org.opensearch.index.mapper.NumberFieldMapper;
+ import org.opensearch.index.mapper.ObjectMapper;
++import org.opensearch.index.mapper.ParametrizedFieldMapper;
+ import org.opensearch.index.mapper.RangeType;
+ import org.opensearch.index.mapper.RoutingFieldMapper;
+ import org.opensearch.index.mapper.SemanticVersionFieldMapper;
+@@ -92,6 +93,8 @@ import org.opensearch.plugins.MapperPlugin;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -112,8 +115,10 @@ public class IndicesModule extends AbstractModule {
+         this.mapperRegistry = new MapperRegistry(
+             getMappers(mapperPlugins),
+             getMetadataMappers(mapperPlugins),
+-            getFieldFilter(mapperPlugins)
++            getFieldFilter(mapperPlugins),
++            getAllowedFieldTypeTransitions(mapperPlugins)
+         );
++        ParametrizedFieldMapper.setAllowedTypeTransitions(this.mapperRegistry.getAllowedFieldTypeTransitions());
+         registerBuiltinWritables();
+     }
+ 
+@@ -287,6 +292,17 @@ public class IndicesModule extends AbstractModule {
+         };
+     }
+ 
++    private static Map<String, Set<String>> getAllowedFieldTypeTransitions(List<MapperPlugin> mapperPlugins) {
++        Map<String, Set<String>> transitions = new HashMap<>();
++        for (MapperPlugin mapperPlugin : mapperPlugins) {
++            Map<String, Set<String>> pluginTransitions = mapperPlugin.getAllowedFieldTypeTransitions();
++            for (Map.Entry<String, Set<String>> entry : pluginTransitions.entrySet()) {
++                transitions.computeIfAbsent(entry.getKey(), k -> new HashSet<>()).addAll(entry.getValue());
++            }
++        }
++        return transitions;
++    }
++
+     @Override
+     protected void configure() {
+         bind(IndicesStore.class).asEagerSingleton();
+diff --git a/server/src/main/java/org/opensearch/indices/mapper/MapperRegistry.java b/server/src/main/java/org/opensearch/indices/mapper/MapperRegistry.java
+index 7974de3514c..e4bf0f14c53 100644
+--- a/server/src/main/java/org/opensearch/indices/mapper/MapperRegistry.java
++++ b/server/src/main/java/org/opensearch/indices/mapper/MapperRegistry.java
+@@ -40,6 +40,7 @@ import org.opensearch.plugins.MapperPlugin;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ 
+@@ -54,15 +55,26 @@ public final class MapperRegistry {
+     private final Map<String, Mapper.TypeParser> mapperParsers;
+     private final Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers;
+     private final Function<String, Predicate<String>> fieldFilter;
++    private final Map<String, Set<String>> allowedFieldTypeTransitions;
+ 
+     public MapperRegistry(
+         Map<String, Mapper.TypeParser> mapperParsers,
+         Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
+         Function<String, Predicate<String>> fieldFilter
++    ) {
++        this(mapperParsers, metadataMapperParsers, fieldFilter, Collections.emptyMap());
++    }
++
++    public MapperRegistry(
++        Map<String, Mapper.TypeParser> mapperParsers,
++        Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
++        Function<String, Predicate<String>> fieldFilter,
++        Map<String, Set<String>> allowedFieldTypeTransitions
+     ) {
+         this.mapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(mapperParsers));
+         this.metadataMapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(metadataMapperParsers));
+         this.fieldFilter = fieldFilter;
++        this.allowedFieldTypeTransitions = Collections.unmodifiableMap(allowedFieldTypeTransitions);
+     }
+ 
+     /**
+@@ -98,4 +110,20 @@ public final class MapperRegistry {
+     public Function<String, Predicate<String>> getFieldFilter() {
+         return fieldFilter;
+     }
++
++    /**
++     * Returns the map of allowed field type transitions registered by plugins.
++     */
++    public Map<String, Set<String>> getAllowedFieldTypeTransitions() {
++        return allowedFieldTypeTransitions;
++    }
++
++    /**
++     * Returns true if a field type transition from {@code fromType} to {@code toType} is allowed
++     * by any registered plugin.
++     */
++    public boolean isTransitionAllowed(String fromType, String toType) {
++        Set<String> allowed = allowedFieldTypeTransitions.get(fromType);
++        return allowed != null && allowed.contains(toType);
++    }
+ }
+diff --git a/server/src/main/java/org/opensearch/plugins/MapperPlugin.java b/server/src/main/java/org/opensearch/plugins/MapperPlugin.java
+index 1480f46582f..a590f9d24f6 100644
+--- a/server/src/main/java/org/opensearch/plugins/MapperPlugin.java
++++ b/server/src/main/java/org/opensearch/plugins/MapperPlugin.java
+@@ -39,6 +39,7 @@ import org.opensearch.index.mapper.MetadataFieldMapper;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ 
+@@ -100,4 +101,16 @@ public interface MapperPlugin {
+     default List<MappingTransformer> getMappingTransformers() {
+         return Collections.emptyList();
+     }
++
++    /**
++     * Returns a map of allowed field type transitions declared by this plugin.
++     * <p>
++     * The key is the source field type (e.g., "text") and the value is a set of
++     * target field types that the source type is allowed to transition to (e.g., ["semantic"]).
++     * When a PutMapping request changes a field's type and the transition is registered here,
++     * the type change will be permitted instead of throwing an error.
++     */
++    default Map<String, Set<String>> getAllowedFieldTypeTransitions() {
++        return Collections.emptyMap();
++    }
+ }
+-- 
+2.47.3
+
