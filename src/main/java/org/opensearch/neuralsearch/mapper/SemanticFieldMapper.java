@@ -281,7 +281,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
             true,
             m -> ((SemanticFieldMapper) m).semanticParameters.getStatus(),
             "ENABLED"
-        );
+        ).alwaysSerialize();
 
         @Setter
         protected ParametrizedFieldMapper.Builder delegateBuilder;
