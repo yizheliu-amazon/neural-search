@@ -227,6 +227,14 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
             null
         );
 
+        @Getter
+        protected final Parameter<String> status = Parameter.stringParam(
+            "status",
+            true,
+            m -> ((SemanticFieldMapper) m).semanticParameters.getStatus(),
+            "ENABLED"
+        );
+
         @Setter
         protected ParametrizedFieldMapper.Builder delegateBuilder;
 
@@ -247,7 +255,8 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 sparseEncodingConfig,
                 skipExistingEmbedding,
                 language,
-                modelType
+                modelType,
+                status
             );
         }
 
@@ -281,6 +290,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .skipExistingEmbedding(skipExistingEmbedding.getValue())
                 .language(language.getValue())
                 .modelType(modelType.getValue())
+                .status(status.getValue())
                 .build();
         }
     }

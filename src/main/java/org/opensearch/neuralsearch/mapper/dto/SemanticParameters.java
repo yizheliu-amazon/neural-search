@@ -34,4 +34,9 @@ public class SemanticParameters {
     private final Boolean skipExistingEmbedding;
     private final String language;
     private final String modelType;
+    private final String status;
+
+    public boolean isEnabled() {
+        return !"DISABLED".equalsIgnoreCase(status);
+    }
 }

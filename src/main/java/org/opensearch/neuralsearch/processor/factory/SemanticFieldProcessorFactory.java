@@ -107,7 +107,13 @@ public final class SemanticFieldProcessorFactory extends AbstractBatchingSystemP
             SemanticMappingUtils.collectSemanticField(properties, semanticFieldPathToConfigMap);
         }
 
-        // If no semantic field we don't need to create a processor so simply return null to show no processor created.
+        // Remove DISABLED fields — they should not be processed by the ingest processor
+        semanticFieldPathToConfigMap.entrySet().removeIf(entry -> {
+            Object status = entry.getValue().get("status");
+            return "DISABLED".equalsIgnoreCase(status != null ? status.toString() : null);
+        });
+
+        // If no enabled semantic field we don't need to create a processor so simply return null to show no processor created.
         if (semanticFieldPathToConfigMap.isEmpty()) {
             return null;
         }

@@ -169,6 +169,17 @@ public class SemanticMappingTransformer implements MappingTransformer {
 
             collectSemanticField(properties, semanticFieldPathToConfigMap);
 
+            // Remove DISABLED fields — they should behave as plain text, no transform needed
+            semanticFieldPathToConfigMap.entrySet().removeIf(entry -> {
+                Object status = entry.getValue().get("status");
+                return "DISABLED".equalsIgnoreCase(status != null ? status.toString() : null);
+            });
+
+            if (semanticFieldPathToConfigMap.isEmpty()) {
+                listener.onResponse(null);
+                return;
+            }
+
             validateSemanticFields(semanticFieldPathToConfigMap);
 
             // Split: fields with model_id go to neural-search's existing path;
