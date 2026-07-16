@@ -147,6 +147,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .language(mergedParams.getLanguage() != null ? mergedParams.getLanguage() : existing.getLanguage())
                 .modelType(mergedParams.getModelType() != null ? mergedParams.getModelType() : existing.getModelType())
                 .status(mergedParams.getStatus() != null ? mergedParams.getStatus() : existing.getStatus())
+                .sourceField(mergedParams.getSourceField() != null ? mergedParams.getSourceField() : existing.getSourceField())
                 .build();
         }
     }
@@ -283,6 +284,14 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
             "ENABLED"
         ).alwaysSerialize();
 
+        @Getter
+        protected final Parameter<String> sourceField = Parameter.stringParam(
+            "source_field",
+            false,  // NOT updateable — set once at creation, cannot be changed
+            m -> ((SemanticFieldMapper) m).semanticParameters.getSourceField(),
+            null
+        );
+
         @Setter
         protected ParametrizedFieldMapper.Builder delegateBuilder;
 
@@ -304,7 +313,8 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 skipExistingEmbedding,
                 language,
                 modelType,
-                status
+                status,
+                sourceField
             );
         }
 
@@ -339,6 +349,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .language(language.getValue())
                 .modelType(modelType.getValue())
                 .status(status.getValue())
+                .sourceField(sourceField.getValue())
                 .build();
         }
     }

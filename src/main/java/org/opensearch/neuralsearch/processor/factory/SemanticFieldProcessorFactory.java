@@ -113,6 +113,15 @@ public final class SemanticFieldProcessorFactory extends AbstractBatchingSystemP
             return "DISABLED".equalsIgnoreCase(status != null ? status.toString() : null);
         });
 
+        // For fields with source_field, set the text source path so processor reads from the source field
+        for (Map.Entry<String, Map<String, Object>> entry : semanticFieldPathToConfigMap.entrySet()) {
+            Object sourceField = entry.getValue().get("source_field");
+            if (sourceField != null) {
+                // Store the source_field so processor knows where to read text from
+                entry.getValue().put("_text_source_path", sourceField.toString());
+            }
+        }
+
         // If no enabled semantic field we don't need to create a processor so simply return null to show no processor created.
         if (semanticFieldPathToConfigMap.isEmpty()) {
             return null;

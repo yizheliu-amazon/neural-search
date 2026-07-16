@@ -35,6 +35,7 @@ public class SemanticParameters {
     private final String language;
     private final String modelType;
     private final String status;
+    private final String sourceField;
 
     public boolean isEnabled() {
         return !"DISABLED".equalsIgnoreCase(status);

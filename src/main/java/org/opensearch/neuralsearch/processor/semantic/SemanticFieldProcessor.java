@@ -416,7 +416,34 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
         for (Map.Entry<String, Map<String, Object>> entry : pathToFieldConfig.entrySet()) {
             final String path = entry.getKey();
             final Map<String, Object> config = entry.getValue();
-            collectSemanticFieldInfo(doc, path.split("\\."), config, 0, "", semanticFieldInfos, docId);
+            final Object textSourcePathObj = config.get("_text_source_path");
+
+            if (textSourcePathObj != null) {
+                // source_field configured: read text from source field, use semantic field path for companion
+                final String textSourcePath = textSourcePathObj.toString();
+                Object textValue = null;
+                if (doc instanceof Map<?, ?> docMap) {
+                    textValue = docMap.get(textSourcePath);
+                }
+                if (textValue instanceof String) {
+                    final SemanticFieldInfo semanticFieldInfo = SemanticFieldInfo.builder()
+                        .value(textValue.toString())
+                        .modelId(getModelId(config, path))
+                        .semanticFieldFullPathInMapping(path)
+                        .semanticFieldFullPathInDoc(path)
+                        .semanticInfoFullPathInDoc(getSemanticInfoFieldFullPath(config, path, path))
+                        .chunkingEnabled(isChunkingEnabled(config, path))
+                        .sparseEncodingConfig(new SparseEncodingConfig(config))
+                        .skipExistingEmbedding(isSkipExistingEmbeddingEnabled(config, path))
+                        .docId(docId)
+                        .build();
+                    semanticFieldInfo.setChunkingConfig(new ChunkingConfig(config), analysisRegistry);
+                    semanticFieldInfos.add(semanticFieldInfo);
+                }
+            } else {
+                // Normal path: read from the semantic field itself
+                collectSemanticFieldInfo(doc, path.split("\\."), config, 0, "", semanticFieldInfos, docId);
+            }
         }
         return semanticFieldInfos;
     }
