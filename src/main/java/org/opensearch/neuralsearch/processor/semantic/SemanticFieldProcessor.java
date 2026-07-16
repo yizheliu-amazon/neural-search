@@ -419,6 +419,21 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
             final Object textSourcePathObj = config.get("_text_source_path");
 
             if (textSourcePathObj != null) {
+                // Reject if doc contains the semantic field directly when source_field is configured
+                if (doc instanceof Map<?, ?> docMap && docMap.containsKey(path)) {
+                    throw new IllegalArgumentException(
+                        "Field ["
+                            + path
+                            + "] has source_field ["
+                            + textSourcePathObj
+                            + "] configured. "
+                            + "Ingest data into ["
+                            + textSourcePathObj
+                            + "] instead of ["
+                            + path
+                            + "]."
+                    );
+                }
                 // source_field configured: read text from source field, use semantic field path for companion
                 final String textSourcePath = textSourcePathObj.toString();
                 Object textValue = null;

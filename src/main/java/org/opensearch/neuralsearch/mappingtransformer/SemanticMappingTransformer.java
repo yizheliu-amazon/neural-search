@@ -169,6 +169,9 @@ public class SemanticMappingTransformer implements MappingTransformer {
 
             collectSemanticField(properties, semanticFieldPathToConfigMap);
 
+            // Validate source_field references exist and are compatible types
+            validateSourceFields(semanticFieldPathToConfigMap, properties);
+
             // Remove DISABLED fields — they should behave as plain text, no transform needed
             semanticFieldPathToConfigMap.entrySet().removeIf(entry -> {
                 Object status = entry.getValue().get("status");
@@ -225,6 +228,44 @@ public class SemanticMappingTransformer implements MappingTransformer {
             listener.onFailure(e);
         }
 
+    }
+
+    @SuppressWarnings("unchecked")
+    private void validateSourceFields(
+        @NonNull final Map<String, Map<String, Object>> semanticFieldPathToConfigMap,
+        @NonNull final Map<String, Object> properties
+    ) {
+        Set<String> compatibleTypes = Set.of("text", "keyword", "match_only_text", "wildcard", "token_count", "binary");
+        for (Map.Entry<String, Map<String, Object>> entry : semanticFieldPathToConfigMap.entrySet()) {
+            Object sourceField = entry.getValue().get("source_field");
+            if (sourceField != null) {
+                String sourceFieldName = sourceField.toString();
+                if (sourceFieldName.isEmpty()) {
+                    throw new IllegalArgumentException("source_field for semantic field [" + entry.getKey() + "] must not be empty.");
+                }
+                Object sourceFieldDef = properties.get(sourceFieldName);
+                if (sourceFieldDef == null) {
+                    // Source field not in this properties map — likely a PutMapping update where
+                    // the source field already exists in the index. Skip validation (it was
+                    // validated at index creation time).
+                    continue;
+                }
+                if (sourceFieldDef instanceof Map<?, ?> sourceMap) {
+                    String sourceType = (String) ((Map<String, Object>) sourceMap).get("type");
+                    if (sourceType != null && !compatibleTypes.contains(sourceType)) {
+                        throw new IllegalArgumentException(
+                            "source_field ["
+                                + sourceFieldName
+                                + "] has type ["
+                                + sourceType
+                                + "] which is not compatible with semantic field. "
+                                + "Compatible types: "
+                                + compatibleTypes
+                        );
+                    }
+                }
+            }
+        }
     }
 
     private void validateSemanticFields(@NonNull final Map<String, Map<String, Object>> semanticFieldPathToConfigMap) {

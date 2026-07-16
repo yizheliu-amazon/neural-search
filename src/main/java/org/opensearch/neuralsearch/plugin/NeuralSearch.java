@@ -141,8 +141,11 @@ import org.opensearch.neuralsearch.transport.NeuralSparseClearCacheTransportActi
 import org.opensearch.neuralsearch.transport.NeuralSparseWarmupAction;
 import org.opensearch.neuralsearch.transport.NeuralSparseWarmupTransportAction;
 
+import org.opensearch.neuralsearch.action.SemanticSearchPipelineActionFilter;
+import org.opensearch.neuralsearch.processor.SemanticSearchRewriteProcessor;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.PipelineServiceUtil;
+import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
@@ -185,6 +188,7 @@ public class NeuralSearch extends Plugin
         EnginePlugin,
         CircuitBreakerPlugin {
     private MLCommonsClientAccessor clientAccessor;
+    private Client client;
     private SemanticMappingTransformer semanticMappingTransformer;
     private NamedXContentRegistry xContentRegistry;
     private NormalizationProcessorWorkflow normalizationProcessorWorkflow;
@@ -217,6 +221,7 @@ public class NeuralSearch extends Plugin
         final Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.clusterService = clusterService;
+        this.client = client;
         // Create clientAccessor first as it's needed by other components
         clientAccessor = new MLCommonsClientAccessor(new MachineLearningNodeClient(client));
 
@@ -387,6 +392,11 @@ public class NeuralSearch extends Plugin
     }
 
     @Override
+    public List<ActionFilter> getActionFilters() {
+        return List.of(new SemanticSearchPipelineActionFilter(clusterService, client));
+    }
+
+    @Override
     public Map<String, org.opensearch.search.pipeline.Processor.Factory<SearchRequestProcessor>> getRequestProcessors(
         Parameters parameters
     ) {
@@ -396,7 +406,9 @@ public class NeuralSearch extends Plugin
             NeuralSparseTwoPhaseProcessor.TYPE,
             new NeuralSparseTwoPhaseProcessor.Factory(),
             AgenticQueryTranslatorProcessor.TYPE,
-            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor)
+            new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor),
+            SemanticSearchRewriteProcessor.TYPE,
+            new SemanticSearchRewriteProcessor.Factory()
         );
     }
 
