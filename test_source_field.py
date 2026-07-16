@@ -388,6 +388,104 @@ def step8_reenable_status():
     return False
 
 
+def step9_existing_index_enable_semantic():
+    """Test enabling semantic on an existing index that already has text field + data."""
+    print_step(9, "Enable semantic on existing index with data")
+
+    idx = "test-existing-index"
+    # Cleanup
+    requests.delete(f"{CLUSTER_URL}/{idx}")
+    time.sleep(1)
+
+    # Create index with text field and ingest data FIRST
+    print("  Creating index with text field and ingesting docs first...")
+    print_curl("PUT", f"/{idx}", {"mappings": {"properties": {"title": {"type": "text"}, "category": {"type": "keyword"}}}})
+    r = requests.put(f"{CLUSTER_URL}/{idx}", json={"mappings": {"properties": {"title": {"type": "text"}, "category": {"type": "keyword"}}}})
+    if r.status_code != 200:
+        print(f"  {RED}FAIL: Could not create index: {r.text}{RESET}")
+        return False
+
+    # Ingest docs into existing text field
+    docs = [
+        {"title": "OpenSearch distributed search engine", "category": "tech"},
+        {"title": "Machine learning for NLP", "category": "ml"},
+        {"title": "Kubernetes container orchestration", "category": "infra"},
+    ]
+    for i, doc in enumerate(docs, 1):
+        requests.put(f"{CLUSTER_URL}/{idx}/_doc/{i}?refresh=true", json=doc)
+    print(f"  Ingested {len(docs)} docs into existing text field")
+
+    # Now enable semantic via PutMapping with source_field
+    print("\n  Enabling semantic on existing index via PutMapping...")
+    print_curl("PUT", f"/{idx}/_mapping", {"properties": {"title_ase": {"type": "semantic", "source_field": "title"}}})
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_mapping", json={"properties": {"title_ase": {"type": "semantic", "source_field": "title"}}})
+    if r.status_code != 200:
+        print(f"  {RED}FAIL: PutMapping failed: {r.text}{RESET}")
+        return False
+    print(f"  {GREEN}PutMapping succeeded — semantic field added to existing index{RESET}")
+
+    time.sleep(8)  # Wait for model
+
+    # Ingest a NEW doc — should get embeddings
+    print("\n  Ingesting new doc after semantic enabled...")
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_doc/4?refresh=true", json={"title": "Neural search transformers", "category": "ml"})
+    if r.status_code not in (200, 201):
+        print(f"  {RED}FAIL: Ingest failed: {r.text}{RESET}")
+        return False
+
+    # Check new doc has embeddings
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_doc/4")
+    source = r.json().get("_source", {})
+    emb = source.get("title_ase_semantic_info", {}).get("embedding", {})
+    print(f"  New doc (4) embeddings: {len(emb)} tokens")
+
+    # Check old doc (1) does NOT have embeddings (not re-processed)
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_doc/1")
+    source_old = r.json().get("_source", {})
+    emb_old = source_old.get("title_ase_semantic_info", {}).get("embedding", {})
+    print(f"  Old doc (1) embeddings: {len(emb_old)} tokens (expected 0 — not re-processed)")
+
+    if len(emb) > 0 and len(emb_old) == 0:
+        print(f"  {GREEN}PASS: Semantic enabled on existing index — new docs get embeddings, old docs untouched{RESET}")
+        return True
+    else:
+        print(f"  {RED}FAIL: Expected new doc with embeddings and old doc without{RESET}")
+        return False
+
+
+def step10_source_field_immutable():
+    """Test that source_field cannot be changed after creation."""
+    print_step(10, "source_field is immutable (cannot be changed)")
+
+    # Try to update source_field on existing semantic field
+    print_curl("PUT", f"/{INDEX_NAME}/_mapping", {"properties": {"title_ase": {"type": "semantic", "source_field": "category"}}})
+    r = requests.put(f"{CLUSTER_URL}/{INDEX_NAME}/_mapping", json={
+        "properties": {"title_ase": {"type": "semantic", "source_field": "category"}}
+    })
+
+    if r.status_code == 400:
+        error_msg = r.json().get("error", {}).get("reason", "")
+        print(f"  Response: 400 — {error_msg[:150]}")
+        print(f"  {GREEN}PASS: Correctly rejected — source_field cannot be changed{RESET}")
+        return True
+    elif r.status_code == 200:
+        # Check if source_field actually changed
+        r2 = requests.get(f"{CLUSTER_URL}/{INDEX_NAME}/_mapping")
+        mapping = r2.json()[INDEX_NAME]["mappings"]["properties"]["title_ase"]
+        current_source = mapping.get("source_field")
+        if current_source == "title":
+            print(f"  Response: 200 but source_field unchanged (still 'title') — preserved by merge")
+            print(f"  {GREEN}PASS: source_field preserved (not updateable){RESET}")
+            return True
+        else:
+            print(f"  {RED}FAIL: source_field was changed to '{current_source}'{RESET}")
+            return False
+    else:
+        print(f"  Unexpected status: {r.status_code} — {r.text[:200]}")
+        print(f"  {RED}FAIL: Unexpected response{RESET}")
+        return False
+
+
 def main():
     print("=" * 70)
     print("  source_field E2E Test")
@@ -411,6 +509,8 @@ def main():
         results["6. Reject direct ingest"] = step6_reject_direct_ingest()
         results["7. Status DISABLED"] = step7_disable_status()
         results["8. Status ENABLED"] = step8_reenable_status()
+        results["9. Existing index enable"] = step9_existing_index_enable_semantic()
+        results["10. source_field immutable"] = step10_source_field_immutable()
 
     # Summary
     print(f"\n{'='*70}")
