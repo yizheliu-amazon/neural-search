@@ -26,7 +26,7 @@ CLUSTER_URL = "http://localhost:9200"
 INDEX_NAME = "test-source-field"
 PIPELINE_NAME = f"{INDEX_NAME}-semantic-search-pipeline"
 # Deployed sparse model ID (register + deploy before running)
-MODEL_ID = "pdN0aZ8BJDOkhAmXwMSz"
+MODEL_ID = None  # Auto-resolved by PretrainedSemanticModelResolver
 
 # ANSI colors for output
 GREEN = "\033[92m"
@@ -81,8 +81,7 @@ def step1_create_index():
                 },
                 "title_ase": {
                     "type": "semantic",
-                    "model_id": MODEL_ID,
-                    "source_field": "title"
+                                        "source_field": "title"
                 }
             }
         }
@@ -271,8 +270,7 @@ def step7_disable_status():
         "properties": {
             "title_ase": {
                 "type": "semantic",
-                "model_id": MODEL_ID,
-                "source_field": "title",
+                                "source_field": "title",
                 "status": "DISABLED"
             }
         }
@@ -334,8 +332,7 @@ def step8_reenable_status():
         "properties": {
             "title_ase": {
                 "type": "semantic",
-                "model_id": MODEL_ID,
-                "source_field": "title",
+                                "source_field": "title",
                 "status": "ENABLED"
             }
         }
@@ -486,6 +483,152 @@ def step10_source_field_immutable():
         return False
 
 
+def step11_cannot_add_source_field_after_creation():
+    """Test that source_field cannot be added to an existing semantic field that was created without it."""
+    print_step(11, "Cannot add source_field to existing semantic field created without it")
+
+    idx = "test-no-source-add"
+    # Cleanup
+    requests.delete(f"{CLUSTER_URL}/{idx}")
+    requests.delete(f"{CLUSTER_URL}/_search/pipeline/{idx}-semantic-search-pipeline")
+    time.sleep(1)
+
+    # Create index with semantic field WITHOUT source_field
+    print("  Creating semantic field WITHOUT source_field...")
+    create_body = {"mappings": {"properties": {"content": {"type": "semantic"}}}}
+    print_curl("PUT", f"/{idx}", create_body)
+    r = requests.put(f"{CLUSTER_URL}/{idx}", json=create_body)
+    if r.status_code != 200:
+        print(f"  {RED}FAIL: Could not create index: {r.text[:200]}{RESET}")
+        return False
+
+    time.sleep(5)
+
+    # Verify GET mapping — no source_field
+    print("\n  Verifying GET mapping (no source_field)...")
+    print_curl("GET", f"/{idx}/_mapping")
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+    mapping = r.json()[idx]["mappings"]["properties"]["content"]
+    print(f"  GET mapping: type={mapping.get('type')}, source_field={mapping.get('source_field', 'NOT SET')}, model_id={mapping.get('model_id', 'N/A')[:12]}...")
+    assert mapping.get("source_field") is None, "source_field should NOT be set"
+    print(f"  {GREEN}Confirmed: source_field not set on initial creation{RESET}")
+
+    # Try to add source_field via PutMapping — should be REJECTED (can't update non-updateable param from null to a value)
+    print("\n  Trying to add source_field via PutMapping (should fail)...")
+    put_body = {"properties": {"content": {"type": "semantic", "source_field": "some_field"}}}
+    print_curl("PUT", f"/{idx}/_mapping", put_body)
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_mapping", json=put_body)
+
+    if r.status_code == 400:
+        error_msg = r.json().get("error", {}).get("reason", "")
+        print(f"  Response: 400 — {error_msg[:150]}")
+        print(f"  {GREEN}PASS: Correctly rejected — cannot add source_field to existing semantic field{RESET}")
+        return True
+    elif r.status_code == 200:
+        # Check if source_field was actually set
+        r2 = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+        mapping2 = r2.json()[idx]["mappings"]["properties"]["content"]
+        if mapping2.get("source_field") is None:
+            print(f"  Response: 200 but source_field still None (preserved by merge — param not updateable)")
+            print(f"  {GREEN}PASS: source_field not added (non-updateable parameter preserved null){RESET}")
+            return True
+        else:
+            print(f"  {RED}FAIL: source_field was added: {mapping2.get('source_field')}{RESET}")
+            return False
+    else:
+        print(f"  Unexpected: {r.status_code} — {r.text[:200]}")
+        print(f"  {RED}FAIL{RESET}")
+        return False
+
+
+def step12_get_mapping_at_each_stage():
+    """Verify GET mapping returns correct state after each operation."""
+    print_step(12, "GET mapping verification at each stage")
+
+    idx = "test-getmapping-stages"
+    # Cleanup
+    requests.delete(f"{CLUSTER_URL}/{idx}")
+    requests.delete(f"{CLUSTER_URL}/_search/pipeline/{idx}-semantic-search-pipeline")
+    time.sleep(1)
+
+    all_pass = True
+
+    # Stage A: Create with text field
+    print("\n  --- Stage A: Create with text field ---")
+    r = requests.put(f"{CLUSTER_URL}/{idx}", json={"mappings": {"properties": {"title": {"type": "text"}}}})
+    print_curl("GET", f"/{idx}/_mapping")
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+    props = r.json()[idx]["mappings"]["properties"]
+    print(f"  Fields: {list(props.keys())}")
+    print(f"  title.type: {props['title']['type']}")
+    assert props["title"]["type"] == "text"
+    assert "title_ase" not in props
+    print(f"  {GREEN}Stage A OK: text field only{RESET}")
+
+    # Stage B: Add semantic with source_field
+    print("\n  --- Stage B: Add semantic with source_field ---")
+    put_body = {"properties": {"title_ase": {"type": "semantic", "source_field": "title"}}}
+    print_curl("PUT", f"/{idx}/_mapping", put_body)
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_mapping", json=put_body)
+    if r.status_code != 200:
+        print(f"  {RED}FAIL: PutMapping failed: {r.text[:200]}{RESET}")
+        return False
+    time.sleep(5)
+
+    print_curl("GET", f"/{idx}/_mapping")
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+    props = r.json()[idx]["mappings"]["properties"]
+    print(f"  Fields: {list(props.keys())}")
+    title_ase = props.get("title_ase", {})
+    print(f"  title_ase: type={title_ase.get('type')}, source_field={title_ase.get('source_field')}, status={title_ase.get('status')}, model_id={title_ase.get('model_id', 'N/A')[:12]}...")
+    has_companion = "title_ase_semantic_info" in props
+    print(f"  Companion field present: {has_companion}")
+
+    assert title_ase.get("type") == "semantic"
+    assert title_ase.get("source_field") == "title"
+    assert title_ase.get("status") == "ENABLED"
+    assert title_ase.get("model_id") is not None
+    assert has_companion
+    print(f"  {GREEN}Stage B OK: semantic + source_field + model_id + companion{RESET}")
+
+    # Stage C: Disable
+    print("\n  --- Stage C: Disable semantic ---")
+    put_body = {"properties": {"title_ase": {"type": "semantic", "status": "DISABLED"}}}
+    print_curl("PUT", f"/{idx}/_mapping", put_body)
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_mapping", json=put_body)
+
+    print_curl("GET", f"/{idx}/_mapping")
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+    props = r.json()[idx]["mappings"]["properties"]
+    title_ase = props.get("title_ase", {})
+    print(f"  title_ase: type={title_ase.get('type')}, source_field={title_ase.get('source_field')}, status={title_ase.get('status')}, model_id={title_ase.get('model_id', 'N/A')[:12]}...")
+
+    assert title_ase.get("status") == "DISABLED"
+    assert title_ase.get("source_field") == "title", f"source_field lost! Got: {title_ase.get('source_field')}"
+    assert title_ase.get("model_id") is not None, "model_id lost!"
+    print(f"  {GREEN}Stage C OK: DISABLED, source_field + model_id preserved{RESET}")
+
+    # Stage D: Re-enable
+    print("\n  --- Stage D: Re-enable ---")
+    put_body = {"properties": {"title_ase": {"type": "semantic", "status": "ENABLED"}}}
+    print_curl("PUT", f"/{idx}/_mapping", put_body)
+    r = requests.put(f"{CLUSTER_URL}/{idx}/_mapping", json=put_body)
+
+    print_curl("GET", f"/{idx}/_mapping")
+    r = requests.get(f"{CLUSTER_URL}/{idx}/_mapping")
+    props = r.json()[idx]["mappings"]["properties"]
+    title_ase = props.get("title_ase", {})
+    print(f"  title_ase: type={title_ase.get('type')}, source_field={title_ase.get('source_field')}, status={title_ase.get('status')}, model_id={title_ase.get('model_id', 'N/A')[:12]}...")
+
+    assert title_ase.get("status") == "ENABLED"
+    assert title_ase.get("source_field") == "title", f"source_field lost! Got: {title_ase.get('source_field')}"
+    assert title_ase.get("model_id") is not None, "model_id lost!"
+    print(f"  {GREEN}Stage D OK: ENABLED, all params preserved{RESET}")
+
+    print(f"\n  {GREEN}PASS: GET mapping correct at all stages{RESET}")
+    return True
+
+
 def main():
     print("=" * 70)
     print("  source_field E2E Test")
@@ -494,6 +637,16 @@ def main():
     if not check_cluster():
         print(f"\n{RED}ERROR: Cluster not available at {CLUSTER_URL}{RESET}")
         sys.exit(1)
+
+    # Configure ML Commons
+    print("  Configuring ML Commons...")
+    requests.put(f"{CLUSTER_URL}/_cluster/settings", json={
+        "persistent": {
+            "plugins.ml_commons.only_run_on_ml_node": False,
+            "plugins.ml_commons.native_memory_threshold": 100,
+            "plugins.ml_commons.jvm_heap_memory_threshold": 100
+        }
+    })
 
     cleanup()
     time.sleep(1)
@@ -511,6 +664,8 @@ def main():
         results["8. Status ENABLED"] = step8_reenable_status()
         results["9. Existing index enable"] = step9_existing_index_enable_semantic()
         results["10. source_field immutable"] = step10_source_field_immutable()
+        results["11. Cannot add source_field later"] = step11_cannot_add_source_field_after_creation()
+        results["12. GET mapping at each stage"] = step12_get_mapping_at_each_stage()
 
     # Summary
     print(f"\n{'='*70}")

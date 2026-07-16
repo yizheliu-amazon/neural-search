@@ -113,7 +113,24 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
     private void preserveExistingParams(SemanticFieldMapper merged) {
         SemanticParameters existing = this.semanticParameters;
         SemanticParameters mergedParams = merged.semanticParameters;
-        if (mergedParams.getModelId() == null && existing.getModelId() != null) {
+
+        // Reject if source_field is being changed (non-null to a different non-null value)
+        if (mergedParams.getSourceField() != null
+            && existing.getSourceField() != null
+            && !mergedParams.getSourceField().equals(existing.getSourceField())) {
+            throw new IllegalArgumentException(
+                "Cannot update parameter [source_field] from [" + existing.getSourceField() + "] to [" + mergedParams.getSourceField() + "]"
+            );
+        }
+
+        // Reject adding source_field to a field that was created without it
+        if (mergedParams.getSourceField() != null && existing.getSourceField() == null) {
+            throw new IllegalArgumentException("Cannot add [source_field] to an existing semantic field that was created without it.");
+        }
+
+        // Preserve system-managed params when incoming is null (partial PutMapping)
+        if ((mergedParams.getModelId() == null && existing.getModelId() != null)
+            || (mergedParams.getSourceField() == null && existing.getSourceField() != null)) {
             merged.semanticParameters = SemanticParameters.builder()
                 .modelId(existing.getModelId())
                 .searchModelId(mergedParams.getSearchModelId() != null ? mergedParams.getSearchModelId() : existing.getSearchModelId())
@@ -287,7 +304,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
         @Getter
         protected final Parameter<String> sourceField = Parameter.stringParam(
             "source_field",
-            false,  // NOT updateable — set once at creation, cannot be changed
+            true,  // updateable so partial PutMapping (status toggle) doesn't throw conflict
             m -> ((SemanticFieldMapper) m).semanticParameters.getSourceField(),
             null
         );
