@@ -406,6 +406,7 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
         }
     }
 
+    @SuppressWarnings("unchecked")
     private List<SemanticFieldInfo> getSemanticFieldInfo(IngestDocument ingestDocument) {
         final List<SemanticFieldInfo> semanticFieldInfos = new ArrayList<>();
         final Object doc = ingestDocument.getSourceAndMetadata();
@@ -416,15 +417,16 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
         for (Map.Entry<String, Map<String, Object>> entry : pathToFieldConfig.entrySet()) {
             final String path = entry.getKey();
             final Map<String, Object> config = entry.getValue();
+
             final Object textSourcePathObj = config.get("_text_source_path");
 
             if (textSourcePathObj != null) {
-                // Reject if doc contains the semantic field directly when source_field is configured
+                // Reject if doc contains the semantic field directly when original_field is configured
                 if (doc instanceof Map<?, ?> docMap && docMap.containsKey(path)) {
                     throw new IllegalArgumentException(
                         "Field ["
                             + path
-                            + "] has source_field ["
+                            + "] has original_field ["
                             + textSourcePathObj
                             + "] configured. "
                             + "Ingest data into ["
@@ -434,7 +436,7 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
                             + "]."
                     );
                 }
-                // source_field configured: read text from source field, use semantic field path for companion
+                // original_field configured: read text from original field, use semantic field path for companion
                 final String textSourcePath = textSourcePathObj.toString();
                 Object textValue = null;
                 if (doc instanceof Map<?, ?> docMap) {

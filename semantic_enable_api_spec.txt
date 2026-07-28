@@ -1,0 +1,128 @@
+Semantic Enable/Disable API Specification
+==========================================
+
+Base path: /_plugins/_neural/semantic
+
+## APIs
+
+### 1. Enable Semantic Enrichment
+
+POST /_plugins/_neural/semantic/{index}/enable
+{
+  "source_field": "title",
+  "semantic_field": "title_semantic",     // name for the new semantic field
+  "language": "ENGLISH",                  // optional, default ENGLISH
+  "model_type": "SPARSE"                  // optional, default SPARSE
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "source_field": "title",
+  "semantic_field": "title_semantic",
+  "model_id": "abc123",
+  "status": "ENABLED"
+}
+
+### 2. Enable Search Query Switch
+
+POST /_plugins/_neural/semantic/{index}/enable_search
+{
+  "source_field": "title",
+  "semantic_field": "title_semantic"
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "pipeline": "my-index-semantic-search-pipeline",
+  "field_map": {
+    "title": {
+      "type": "sparse",
+      "target_field": "title_semantic_semantic_info.embedding",
+      "model_id": "abc123"
+    }
+  }
+}
+
+### 3. Disable Search Query Switch
+
+POST /_plugins/_neural/semantic/{index}/disable_search
+{
+  "source_field": "title",
+  "semantic_field": "title_semantic"
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "pipeline_removed": true
+}
+
+## Validation Rules
+
+### enable
+- source_field must exist in index mapping
+- source_field type must be in [text, keyword, match_only_text, wildcard, token_count, binary]
+- source_field must not already be enriched by another semantic field
+- semantic_field must not already exist (unless it was previously created by this API)
+
+### enable_search
+- semantic_field must exist and have model_id resolved
+- source_field must match the semantic_field's configured source
+- No other semantic field already has search enabled for this source_field
+
+### disable_search
+- Search pipeline must currently be active for this source_field
+
+## Internal Implementation
+
+### enable:
+1. Validate source_field exists and is compatible type
+2. Resolve model_id via SemanticModelResolver (language + model_type)
+3. Call PutMapping to create semantic field with source_field param
+   (triggers SemanticMappingTransformer → creates companion field)
+4. SemanticFieldProcessor automatically picks up the new field
+   (reads from source_field, generates embeddings on subsequent ingests)
+
+### enable_search:
+1. Validate semantic_field is ENABLED with model_id
+2. Build search pipeline body with semantic_search_rewrite_processor
+3. Create/update the search pipeline
+4. Set index.search.default_pipeline to the pipeline name
+
+### disable_search:
+1. Remove field_map entry for this source_field from pipeline
+2. If no entries remain, delete pipeline and unset default_pipeline
+3. If entries remain, update pipeline without this field
+
+## Customer Workflow
+
+1. Customer has index "products" with field "description" (type: text)
+
+2. Enable enrichment:
+   POST /_plugins/_neural/semantic/products/enable
+   {"source_field": "description", "semantic_field": "desc_semantic"}
+   → New docs get embeddings automatically
+
+3. Backfill existing docs (optional):
+   POST /products/_update_by_query
+   {"query": {"match_all": {}}}
+   → Old docs re-processed through ingest, get embeddings
+
+4. Test quality with explicit neural queries:
+   GET /products/_search
+   {"query": {"neural_sparse": {"desc_semantic_semantic_info.embedding": {"query_text": "..."}}}}
+
+5. Enable search rewrite:
+   POST /_plugins/_neural/semantic/products/enable_search
+   {"source_field": "description", "semantic_field": "desc_semantic"}
+   → Now match queries on "description" auto-rewrite to neural
+
+6. Rollback if needed:
+   POST /_plugins/_neural/semantic/products/disable_search
+   {"source_field": "description", "semantic_field": "desc_semantic"}
+   → Back to BM25, embeddings still being generated for new docs

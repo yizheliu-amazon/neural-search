@@ -113,12 +113,14 @@ public final class SemanticFieldProcessorFactory extends AbstractBatchingSystemP
             return "DISABLED".equalsIgnoreCase(status != null ? status.toString() : null);
         });
 
-        // For fields with source_field, set the text source path so processor reads from the source field
+        // For fields with original_field, use copy mode: the processor reads text from the original
+        // field and generates embeddings into the semantic field's companion embedding field. The
+        // original field's own text is left untouched.
         for (Map.Entry<String, Map<String, Object>> entry : semanticFieldPathToConfigMap.entrySet()) {
-            Object sourceField = entry.getValue().get("source_field");
-            if (sourceField != null) {
-                // Store the source_field so processor knows where to read text from
-                entry.getValue().put("_text_source_path", sourceField.toString());
+            Object originalField = entry.getValue().get("original_field");
+            if (originalField != null) {
+                // COPY MODE: read text from original_field
+                entry.getValue().put("_text_source_path", originalField.toString());
             }
         }
 

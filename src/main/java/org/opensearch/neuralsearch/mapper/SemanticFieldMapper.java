@@ -114,23 +114,27 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
         SemanticParameters existing = this.semanticParameters;
         SemanticParameters mergedParams = merged.semanticParameters;
 
-        // Reject if source_field is being changed (non-null to a different non-null value)
-        if (mergedParams.getSourceField() != null
-            && existing.getSourceField() != null
-            && !mergedParams.getSourceField().equals(existing.getSourceField())) {
+        // Reject if original_field is being changed (non-null to a different non-null value)
+        if (mergedParams.getOriginalField() != null
+            && existing.getOriginalField() != null
+            && !mergedParams.getOriginalField().equals(existing.getOriginalField())) {
             throw new IllegalArgumentException(
-                "Cannot update parameter [source_field] from [" + existing.getSourceField() + "] to [" + mergedParams.getSourceField() + "]"
+                "Cannot update parameter [original_field] from ["
+                    + existing.getOriginalField()
+                    + "] to ["
+                    + mergedParams.getOriginalField()
+                    + "]"
             );
         }
 
-        // Reject adding source_field to a field that was created without it
-        if (mergedParams.getSourceField() != null && existing.getSourceField() == null) {
-            throw new IllegalArgumentException("Cannot add [source_field] to an existing semantic field that was created without it.");
+        // Reject adding original_field to a field that was created without it
+        if (mergedParams.getOriginalField() != null && existing.getOriginalField() == null) {
+            throw new IllegalArgumentException("Cannot add [original_field] to an existing semantic field that was created without it.");
         }
 
         // Preserve system-managed params when incoming is null (partial PutMapping)
         if ((mergedParams.getModelId() == null && existing.getModelId() != null)
-            || (mergedParams.getSourceField() == null && existing.getSourceField() != null)) {
+            || (mergedParams.getOriginalField() == null && existing.getOriginalField() != null)) {
             merged.semanticParameters = SemanticParameters.builder()
                 .modelId(existing.getModelId())
                 .searchModelId(mergedParams.getSearchModelId() != null ? mergedParams.getSearchModelId() : existing.getSearchModelId())
@@ -164,7 +168,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .language(mergedParams.getLanguage() != null ? mergedParams.getLanguage() : existing.getLanguage())
                 .modelType(mergedParams.getModelType() != null ? mergedParams.getModelType() : existing.getModelType())
                 .status(mergedParams.getStatus() != null ? mergedParams.getStatus() : existing.getStatus())
-                .sourceField(mergedParams.getSourceField() != null ? mergedParams.getSourceField() : existing.getSourceField())
+                .originalField(mergedParams.getOriginalField() != null ? mergedParams.getOriginalField() : existing.getOriginalField())
                 .build();
         }
     }
@@ -302,10 +306,10 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
         ).alwaysSerialize();
 
         @Getter
-        protected final Parameter<String> sourceField = Parameter.stringParam(
-            "source_field",
+        protected final Parameter<String> originalField = Parameter.stringParam(
+            "original_field",
             true,  // updateable so partial PutMapping (status toggle) doesn't throw conflict
-            m -> ((SemanticFieldMapper) m).semanticParameters.getSourceField(),
+            m -> ((SemanticFieldMapper) m).semanticParameters.getOriginalField(),
             null
         );
 
@@ -331,7 +335,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 language,
                 modelType,
                 status,
-                sourceField
+                originalField
             );
         }
 
@@ -366,7 +370,7 @@ public class SemanticFieldMapper extends ParametrizedFieldMapper {
                 .language(language.getValue())
                 .modelType(modelType.getValue())
                 .status(status.getValue())
-                .sourceField(sourceField.getValue())
+                .originalField(originalField.getValue())
                 .build();
         }
     }

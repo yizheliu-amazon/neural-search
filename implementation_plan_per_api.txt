@@ -1,0 +1,275 @@
+Detailed Implementation Plan — Per API & Per Pipeline
+======================================================
+
+## Feasibility Summary
+
+| API                          | Search Pipeline Change | Ingest Processor Change | Feasible? |
+|------------------------------|------------------------|-------------------------|-----------|
+| enable_semantic_enrichment   | Create new pipeline    | Existing behavior       | YES       |
+| disable_semantic_enrichment  | No change              | Disable via status      | YES       |
+| enable_semantic_search       | Add field_replacement  | No change               | YES       |
+| disable_semantic_search      | Remove field_replacement| No change              | YES       |
+| deploy_semantic_enrichment   | Add field_replacement  | Toggle rename/copy      | YES       |
+| rollback_semantic_enrichment | Remove field_replacement| Toggle rename/copy     | YES       |
+| list_semantic_enrichment     | Read pipeline state    | Read mapping state      | YES       |
+
+All APIs are feasible. No Core change needed.
+
+
+## Search Pipeline — Detailed Implementation
+
+### Pipeline Structure After enable_semantic_enrichment
+
+Pipeline name: {index}-semantic-search-pipeline
+Set as: index.search.default_pipeline
+
+{
+  "request_processors": [
+    {
+      "semantic_search_rewrite_processor": {
+        "field_map": {
+          "title_semantic": {
+            "type": "sparse",
+            "target_field": "title_semantic_semantic_info.embedding",
+            "model_id": "abc123",
+            "analyzer": "bert-uncased"
+          }
+        }
+      }
+    },
+    {
+      "neural_sparse_two_phase_processor": {
+        "enabled": true
+      }
+    }
+  ]
+}
+
+Note: field_map key is "title_semantic" (the semantic field name), NOT "title"
+(the source field). At this stage, only explicit queries on the semantic field
+get rewritten. Queries on "title" are NOT rewritten yet.
+
+### Pipeline Structure After enable_semantic_search
+
+A new "field_replacement_processor" is PREPENDED to request_processors:
+
+{
+  "request_processors": [
+    {
+      "field_replacement_processor": {
+        "field_map": {
+          "title": "title_semantic"
+        }
+      }
+    },
+    {
+      "semantic_search_rewrite_processor": {
+        "field_map": {
+          "title_semantic": {
+            "type": "sparse",
+            "target_field": "title_semantic_semantic_info.embedding",
+            "model_id": "abc123",
+            "analyzer": "bert-uncased"
+          }
+        }
+      }
+    },
+    {
+      "neural_sparse_two_phase_processor": {
+        "enabled": true
+      }
+    }
+  ]
+}
+
+The field_replacement_processor:
+- Intercepts the incoming query
+- For each match query on "title" → changes the field name to "title_semantic"
+- The semantic_search_rewrite_processor then sees match on "title_semantic"
+  and rewrites it to neural_sparse
+
+### field_replacement_processor — NEW processor to implement
+
+Type: "field_replacement_processor"
+Config: { "field_map": { "source_field_name": "target_semantic_field_name" } }
+Behavior: Walks the query tree, for any MatchQueryBuilder whose fieldName()
+  is in the field_map, replaces it with a new MatchQueryBuilder on the
+  mapped target field (same query text, same params).
+
+Implementation:
+  - New class: FieldReplacementProcessor implements SearchRequestProcessor
+  - Reuses the same query-walking pattern as SemanticSearchRewriteProcessor
+    (match, bool, boosting, constant_score, dismax, function_score, hybrid)
+  - But instead of converting to neural, just changes the field name
+  - Register in getRequestProcessors() in NeuralSearch.java
+
+This is a simple processor (~80 lines). It's essentially:
+  if (matchQuery.fieldName() in fieldMap):
+      return new MatchQueryBuilder(fieldMap.get(fieldName), matchQuery.value())
+          .analyzer(matchQuery.analyzer())
+          .boost(matchQuery.boost());
+
+### enable_semantic_search implementation:
+  1. GET existing pipeline: GET /_search/pipeline/{index}-semantic-search-pipeline
+  2. Parse the JSON, prepend field_replacement_processor to request_processors
+  3. PUT updated pipeline: PUT /_search/pipeline/{index}-semantic-search-pipeline
+
+### disable_semantic_search implementation:
+  1. GET existing pipeline
+  2. Remove the field_replacement_processor from request_processors
+  3. PUT updated pipeline (without field_replacement_processor)
+
+
+## Ingest Processor — Detailed Implementation
+
+### Current behavior (SemanticFieldProcessor):
+
+The factory reads the mapping. For each semantic field:
+- If _text_source_path is set → "copy mode": read from source_field, generate embeddings
+- If _text_source_path is null → "direct mode": read from semantic field itself
+
+### What needs to change for deploy/rollback:
+
+When "rename" is active (deploy_semantic_enrichment):
+1. The processor should rename source_field → semantic_field in the doc
+2. Then read from semantic_field (the renamed field) for embedding generation
+3. Do NOT read from source_field (it no longer exists in doc after rename)
+
+When "copy" is active (default, or after rollback):
+1. Read from source_field → generate embeddings
+2. Write embeddings to companion field
+3. Source_field data stays in the doc (both fields present)
+
+### Where to store the rename/copy toggle:
+
+Option chosen: Store a `_rename_active` flag in the semantic field mapping.
+
+The API (deploy_semantic_enrichment) does:
+  PutMapping: {"title_semantic": {"type":"semantic", "_rename_active": true}}
+
+The API (rollback_semantic_enrichment) does:
+  PutMapping: {"title_semantic": {"type":"semantic", "_rename_active": false}}
+
+Note: This is an internal param. Not exposed to customers. The SemanticFieldMapper
+needs to accept this param (add it as a Parameter with updateable=true).
+
+### SemanticFieldProcessorFactory changes:
+
+In newProcessor(), after collecting field configs:
+
+  for each field in semanticFieldPathToConfigMap:
+    Object renameActive = config.get("_rename_active");
+    Object sourceField = config.get("source_field");
+
+    if (renameActive == true && sourceField != null):
+      config.put("_rename_source", sourceField)   // tells processor to rename
+      config.remove("_text_source_path")          // don't use copy path
+    elif (sourceField != null):
+      config.put("_text_source_path", sourceField) // existing copy behavior
+
+### SemanticFieldProcessor changes:
+
+In getSemanticFieldInfo():
+
+  Object renameSource = config.get("_rename_source");
+  if (renameSource != null):
+    // RENAME MODE: rename source_field → semantic_field in doc, then read from semantic field
+    String srcField = renameSource.toString();
+    if (doc instanceof Map docMap && docMap.containsKey(srcField)):
+      Object textValue = docMap.remove(srcField)       // remove from source
+      docMap.put(path, textValue)                      // put into semantic field
+      // Now fall through to normal "read from semantic field" path
+    // Continue with collectSemanticFieldInfo() which reads from the field itself
+
+  elif (textSourcePathObj != null):
+    // COPY MODE: existing behavior (read from source, generate embeddings)
+    ...
+
+  else:
+    // DIRECT MODE: normal semantic field behavior
+    ...
+
+This is ~15 lines of new code in the processor.
+
+
+## deploy_semantic_enrichment — Full Implementation Steps
+
+1. REST handler validates: index exists, semantic field exists, has model_id
+2. PutMapping: set _rename_active=true on the semantic field
+   → Factory rebuilds processor: rename mode enabled, copy mode disabled
+3. GET existing search pipeline
+4. Prepend field_replacement_processor (if not already present)
+5. PUT updated pipeline
+6. Return response
+
+## rollback_semantic_enrichment — Full Implementation Steps
+
+1. REST handler validates: index exists, semantic field exists
+2. PutMapping: set _rename_active=false on the semantic field
+   → Factory rebuilds processor: copy mode re-enabled, rename mode disabled
+3. GET existing search pipeline
+4. Remove field_replacement_processor (if present)
+5. PUT updated pipeline
+6. Return response
+
+
+## list_semantic_enrichment — Implementation
+
+1. Read index mapping → find semantic fields with source_field
+2. Read index settings → check default_pipeline name
+3. GET search pipeline → check if field_replacement_processor is present
+4. For each semantic field, read _rename_active flag from mapping
+5. Derive state:
+   - status=DISABLED → DISABLED
+   - _rename_active=true + field_replacement present → DEPLOYED
+   - field_replacement present (but _rename_active=false) → SEARCHING
+   - Otherwise → ENRICHING
+6. Return JSON array of field states
+
+
+## New Files to Create
+
+1. src/.../processor/FieldReplacementProcessor.java (~100 lines)
+   - SearchRequestProcessor that renames field in match queries
+   - Walks query tree same as SemanticSearchRewriteProcessor
+   - Factory inner class
+
+2. Modifications to existing files:
+   - NeuralSearch.java: register FieldReplacementProcessor in getRequestProcessors()
+   - SemanticFieldMapper.java: add _rename_active Parameter
+   - SemanticFieldProcessorFactory.java: handle _rename_active flag
+   - SemanticFieldProcessor.java: add rename mode logic (~15 lines)
+   - RestSemanticEnableHandler.java: update all handler methods
+
+## Effort Estimate
+
+| Component                          | Lines of Code | Complexity |
+|------------------------------------|---------------|------------|
+| FieldReplacementProcessor (new)    | ~100          | Low        |
+| SemanticFieldProcessor changes     | ~15           | Low        |
+| SemanticFieldProcessorFactory      | ~10           | Low        |
+| SemanticFieldMapper (_rename_active)| ~5           | Low        |
+| RestSemanticEnableHandler (rewrite)| ~200          | Medium     |
+| NeuralSearch.java registration     | ~2            | Trivial    |
+| E2E test updates                   | ~150          | Medium     |
+| Total                              | ~480          | Medium     |
+
+
+## Risks & Concerns
+
+1. Pipeline update race: GET-then-PUT pipeline is not atomic. If two concurrent
+   API calls modify the pipeline, one can overwrite the other. For POC this is
+   acceptable. Production would need optimistic locking (version check).
+
+2. _rename_active in mapping: Adding internal params to customer-visible mapping
+   is not ideal. Customer could see it in GET _mapping. Acceptable for POC.
+   Production alternative: store in index settings or _meta.
+
+3. Rename in processor removes source_field from doc: After deploy, old docs
+   still have "title" (not renamed). Only new docs have "title_semantic".
+   This is by design — customer should backfill before deploying.
+
+4. System processor cache: SemanticFieldProcessor is cached per-index. After
+   PutMapping changes _rename_active, the cache needs invalidation. The existing
+   SystemIngestPipelineCache.invalidateCacheForIndex() should handle this
+   (triggered by mapping change).

@@ -224,13 +224,13 @@ public class SemanticSearchPipelineActionFilter implements ActionFilter {
                 if ("ENABLED".equalsIgnoreCase(status)) {
                     String modelId = (String) fieldDef.get("model_id");
                     String modelType = (String) fieldDef.getOrDefault("model_type", "SPARSE");
-                    String sourceField = (String) fieldDef.get("source_field");
+                    String originalField = (String) fieldDef.get("original_field");
                     String targetField = fieldName + "_semantic_info.embedding";
 
-                    // Key decision: if source_field is configured, map source_field -> embedding
-                    // so that match queries on the source field get rewritten.
+                    // Key decision: if original_field is configured, map original_field -> embedding
+                    // so that match queries on the original field get rewritten.
                     // Otherwise, map the semantic field name itself.
-                    String mapKey = (sourceField != null && !sourceField.isEmpty()) ? sourceField : fieldName;
+                    String mapKey = (originalField != null && !originalField.isEmpty()) ? originalField : fieldName;
                     result.put(mapKey, new SemanticFieldInfo(modelId, modelType, targetField));
                 }
             }

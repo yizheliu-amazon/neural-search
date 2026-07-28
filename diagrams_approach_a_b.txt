@@ -1,0 +1,251 @@
+Workflow Diagrams — Approach A (source_field) vs Approach B (Semantic Enable API)
+==================================================================================
+
+
+============================================================
+APPROACH A: source_field Option — Workflow Diagram
+============================================================
+
+
+Customer Workflow:
+═════════════════
+
+┌──────────────┐    PutMapping     ┌────────────────────────────────────────┐
+│   Customer   │ ─────────────────►│  Add semantic field with source_field   │
+│   (1 step)   │                   │  {"title_ase":{"type":"semantic",       │
+└──────────────┘                   │   "source_field":"title"}}              │
+                                   └───────────────────┬────────────────────┘
+                                                       │
+                                        ┌──────────────┼──────────────┐
+                                        │              │              │
+                                        ▼              ▼              ▼
+                              ┌─────────────┐ ┌──────────────┐ ┌──────────────┐
+                              │  Companion   │ │ Search       │ │ Ingest       │
+                              │  field       │ │ pipeline     │ │ processor    │
+                              │  created     │ │ auto-created │ │ auto-created │
+                              └─────────────┘ │ + attached   │ └──────┬───────┘
+                                              └──────┬───────┘        │
+                                                     │                │
+                            IMMEDIATELY ACTIVE        │                │
+                                                     ▼                ▼
+                                        ┌────────────────────────────────────┐
+                                        │  EVERYTHING IS ON                   │
+                                        │  • Embeddings generated             │
+                                        │  • Search rewrite active            │
+                                        │  • No way to test first             │
+                                        └────────────────────────────────────┘
+                                                     │
+                                          ┌──────────┴──────────┐
+                                          ▼                     ▼
+                                  ┌──────────────┐    ┌─────────────────┐
+                                  │ Good quality │    │  Bad quality     │
+                                  │ → keep it    │    │  → DISABLE       │
+                                  └──────────────┘    │  (stops BOTH     │
+                                                      │   emb + search)  │
+                                                      └─────────────────┘
+
+
+Ingest Flow (source_field option):
+══════════════════════════════════
+
+  ┌───────────────┐     ┌──────────────────────┐     ┌────────────────────────────┐
+  │ App sends:    │     │ System Ingest Proc:  │     │ Doc stored:                │
+  │               │     │                      │     │                            │
+  │ {"title":     │────►│ 1. Read "title"      │────►│ {"title": "hello",         │
+  │  "hello"}     │     │ 2. Generate embeddings│     │  "title_ase_semantic_info":│
+  │               │     │ 3. Write to companion│     │   {"embedding": {...}}}    │
+  └───────────────┘     └──────────────────────┘     └────────────────────────────┘
+
+  Note: "title_ase" field itself is NEVER populated with data.
+  It's a metadata-only field in the mapping.
+
+
+Query Flow (source_field option):
+═════════════════════════════════
+
+  ┌───────────────────┐     ┌────────────────────────────┐     ┌──────────────────┐
+  │ App sends:        │     │ Search Pipeline:            │     │ Result:          │
+  │                   │     │                             │     │                  │
+  │ match on "title"  │────►│ field_map has "title" key   │────►│ neural_sparse on │
+  │ "hello"           │     │ → rewrite to neural_sparse  │     │ title_ase_       │
+  │                   │     │   on title_ase_semantic_info │     │ semantic_info.   │
+  │                   │     │   .embedding                │     │ embedding        │
+  └───────────────────┘     └────────────────────────────┘     └──────────────────┘
+
+  Note: field_map key is "title" (source_field name).
+  Rewrite is immediate — no opt-in.
+
+
+State Diagram (source_field option):
+════════════════════════════════════
+
+  PutMapping
+      │
+      ▼
+  ┌─────────┐   status=DISABLED   ┌──────────┐
+  │ ACTIVE  │ ───────────────────►│ DISABLED │
+  │(emb+srch│ ◄───────────────────│(nothing) │
+  │ both on)│   status=ENABLED    └──────────┘
+  └─────────┘
+
+  Only 2 states. No gradual rollout.
+
+
+
+============================================================
+APPROACH B: Semantic Enable API — Workflow Diagram
+============================================================
+
+
+Customer Workflow:
+═════════════════
+
+┌──────────────┐  enable_semantic_enrichment  ┌────────────────────────────────┐
+│   Customer   │─────────────────────────────►│  ENRICHING                      │
+│              │                               │  • Embeddings: ON              │
+│              │                               │  • Search on source: BM25      │
+│              │                               │  • Search on semantic: neural  │
+│              │                               └───────────────┬────────────────┘
+│              │                                               │
+│              │         Customer tests quality                │
+│              │         by querying semantic field directly    │
+│              │         (compare BM25 vs neural)              │
+│              │                                               │
+│              │         Customer backfills old docs            │
+│              │         (_update_by_query)                     │
+│              │                                               │
+│              │  deploy_semantic_enrichment   ┌────────────────▼───────────────┐
+│              │─────────────────────────────►│  DEPLOYED                       │
+│              │                               │  • Rename: ON (data→semantic)  │
+│              │                               │  • Search on source: neural    │
+│              │                               │  • App unchanged               │
+│              │                               └───────────────┬────────────────┘
+│              │                                               │
+│              │  rollback_semantic_enrichment                  │
+│              │◄──────────────────────────────────────────────┘
+│              │         (back to ENRICHING)
+│              │
+│              │  disable_semantic_enrichment  ┌────────────────────────────────┐
+│              │─────────────────────────────►│  DISABLED                       │
+│              │    (from any state)           │  • Everything: OFF             │
+│              │                               │  • Full cleanup                │
+└──────────────┘                               └────────────────────────────────┘
+
+
+Ingest Flow — ENRICHING state:
+══════════════════════════════
+
+  ┌───────────────┐     ┌──────────────────────┐     ┌─────────────────────────────────┐
+  │ App sends:    │     │ System Ingest Proc:  │     │ Doc stored:                     │
+  │               │     │ (COPY mode)          │     │                                 │
+  │ {"title":     │────►│ 1. Read "title"      │────►│ {"title": "hello",              │
+  │  "hello"}     │     │ 2. Generate embeddings│     │  "title_semantic_semantic_info":│
+  │               │     │ 3. Write to companion│     │   {"embedding": {...}}}         │
+  └───────────────┘     └──────────────────────┘     └─────────────────────────────────┘
+
+  Both "title" (text) and embeddings are stored. BM25 on "title" still works.
+
+
+Ingest Flow — DEPLOYED state:
+═════════════════════════════
+
+  ┌───────────────┐     ┌──────────────────────┐     ┌─────────────────────────────────┐
+  │ App sends:    │     │ System Ingest Proc:  │     │ Doc stored:                     │
+  │               │     │ (RENAME mode)        │     │                                 │
+  │ {"title":     │────►│ 1. Rename "title"    │────►│ {"title_semantic": "hello",     │
+  │  "hello"}     │     │    → "title_semantic"│     │  "title_semantic_semantic_info":│
+  │               │     │ 2. Read renamed field│     │   {"embedding": {...}}}         │
+  │               │     │ 3. Generate embeddings│     │                                 │
+  └───────────────┘     └──────────────────────┘     └─────────────────────────────────┘
+
+  "title" is gone from new docs. Data flows directly to semantic field.
+
+
+Query Flow — ENRICHING state:
+═════════════════════════════
+
+  ┌────────────────────┐     ┌─────────────────────────────────────────┐     ┌──────────────┐
+  │ App sends:         │     │ Search Pipeline:                         │     │ Result:      │
+  │                    │     │                                          │     │              │
+  │ match on "title"   │────►│ No FieldReplacementProcessor             │────►│ Normal BM25  │
+  │ "hello"            │     │ → "title" not in rewrite field_map       │     │ on "title"   │
+  │                    │     │   (field_map keyed on "title_semantic")  │     │              │
+  └────────────────────┘     └─────────────────────────────────────────┘     └──────────────┘
+
+  Source_field queries are UNCHANGED. Customer's app behaves exactly as before.
+
+  ┌────────────────────┐     ┌──────────────────────────────────────┐     ┌──────────────────┐
+  │ Customer tests:    │     │ Search Pipeline:                      │     │ Result:          │
+  │                    │     │                                       │     │                  │
+  │ match on           │────►│ "title_semantic" IS in rewrite        │────►│ neural_sparse on │
+  │ "title_semantic"   │     │ field_map → rewrite to neural_sparse  │     │ embedding field  │
+  │ "hello"            │     │                                       │     │                  │
+  └────────────────────┘     └──────────────────────────────────────┘     └──────────────────┘
+
+  Customer can explicitly test neural quality by querying the semantic field.
+
+
+Query Flow — DEPLOYED state:
+════════════════════════════
+
+  ┌────────────────────┐     ┌──────────────────────────────────────────────┐     ┌──────────────────┐
+  │ App sends:         │     │ Search Pipeline:                              │     │ Result:          │
+  │                    │     │                                               │     │                  │
+  │ match on "title"   │────►│ 1. FieldReplacementProcessor:                │────►│ neural_sparse on │
+  │ "hello"            │     │    "title" → "title_semantic"                │     │ embedding field  │
+  │                    │     │ 2. SemanticSearchRewriteProcessor:            │     │                  │
+  │                    │     │    "title_semantic" in field_map → neural     │     │                  │
+  └────────────────────┘     └──────────────────────────────────────────────┘     └──────────────────┘
+
+  App's query on "title" transparently goes through neural. No app change needed.
+
+
+State Diagram (Semantic Enable API):
+════════════════════════════════════
+
+  enable_semantic_enrichment
+          │
+          ▼
+  ┌───────────────────────────────────────────────────┐
+  │               ENRICHING                            │
+  │                                                   │
+  │  Ingest: copy mode (source→embeddings)            │
+  │  Query on source_field: BM25 (unchanged)          │
+  │  Query on semantic_field: neural (for testing)    │
+  │                                                   │
+  │  Customer: tests quality, backfills old docs      │
+  └───────────────────────────┬───────────────────────┘
+                              │
+          deploy_semantic_enrichment
+                              │
+                              ▼
+  ┌───────────────────────────────────────────────────┐
+  │               DEPLOYED                             │
+  │                                                   │
+  │  Ingest: rename mode (source→semantic directly)   │
+  │  Query on source_field: neural (via replacement)  │
+  │  Query on semantic_field: neural                  │
+  │                                                   │
+  │  Customer: production mode, app unchanged         │
+  └───────────────────────────┬───────────────────────┘
+                              │
+          rollback_semantic_enrichment
+                              │
+                              ▼
+  ┌───────────────────────────────────────────────────┐
+  │               ENRICHING (again)                    │
+  │                                                   │
+  │  Back to copy mode + BM25 on source_field         │
+  └───────────────────────────────────────────────────┘
+
+
+  From ANY state:
+          │
+          │  disable_semantic_enrichment
+          ▼
+  ┌───────────────────────────────────────────────────┐
+  │               DISABLED                             │
+  │                                                   │
+  │  Everything OFF. Full cleanup performed.           │
+  │  No embeddings, no rename, no query rewrite.      │
+  └───────────────────────────────────────────────────┘

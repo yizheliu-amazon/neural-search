@@ -1,0 +1,350 @@
+Semantic Enrichment API — Implementation Summary (Revised)
+=============================================================
+
+Branch: ase-semantic-enable-api
+Base: ase-source-field-poc (includes semantic field with source_field, status,
+      language/model_type, auto search pipeline, and SemanticFieldProcessor)
+
+## What Was Implemented
+
+A set of 5 REST APIs in the neural-search plugin that provide a complete lifecycle
+for enabling semantic search on existing text fields — without requiring customers
+to change their application code or index mapping directly.
+
+### APIs
+
+POST /_plugins/_neural/semantic/{index}/enable_semantic_enrichment
+POST /_plugins/_neural/semantic/{index}/disable_semantic_enrichment
+POST /_plugins/_neural/semantic/{index}/deploy_semantic_enrichment
+POST /_plugins/_neural/semantic/{index}/rollback_semantic_enrichment
+GET  /_plugins/_neural/semantic/{index}/list_semantic_enrichment
+
+All POST APIs accept a "fields" array for batch operations on multiple fields:
+{
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic", "language": "ENGLISH", "model_type": "SPARSE"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+
+## How It Works — Corrected Internal Architecture
+
+### Search Pipeline Structure
+
+The search pipeline has up to 3 processors in order:
+
+1. [Optional] Field Replacement Processor — replaces source_field with
+   target_semantic_field in the query (only present after deploy_semantic_enrichment)
+2. Semantic Search Rewrite Processor — rewrites match queries on semantic field
+   to neural_sparse/neural queries against the embedding companion field
+3. Neural Sparse Two Phase Processor — efficiency optimization
+
+The pipeline is created during enable_semantic_enrichment.
+deploy_semantic_enrichment adds processor #1 to the existing pipeline.
+
+### source_field Parameter
+
+The source_field stored on the semantic field mapping is metadata only — it records
+which original text field this semantic field is "linked to". It is:
+- NOT customer-updatable (immutable after creation)
+- NOT the same as Option 3 in the backup plan design (which changes ingest behavior)
+- Used by the copy ingest processor to know where to read text from
+- Used by the search pipeline to know the field_map key
+
+### Ingest Pipeline Structure
+
+Two system-generated ingest processors (managed internally):
+
+1. Copy Processor — reads text from source_field, writes to semantic field,
+   generates embeddings. Active by default after enable_semantic_enrichment.
+2. Rename Processor — renames source_field to semantic field in the doc.
+   Only active after deploy_semantic_enrichment.
+
+Only one of copy/rename is active at a time.
+
+
+## Internal Flow for Each API
+
+### enable_semantic_enrichment
+  1. Validates: index exists, source_field exists + compatible type, no duplicate
+  2. Calls PutMapping: creates semantic field with source_field (metadata link),
+     language, model_type
+  3. PutMapping triggers SemanticMappingTransformer → resolves model → creates
+     companion embedding field
+  4. Creates search pipeline with:
+     - semantic_search_rewrite_processor (field_map: semantic_field → embedding)
+     - neural_sparse_two_phase_processor
+  5. Sets index.search.default_pipeline to the new pipeline
+  6. Copy ingest processor auto-discovers new semantic field on next ingest
+     (reads from source_field, generates embeddings, writes to companion)
+  Result: New docs get embeddings. text data for new docsis ingested for source_field + semantic field, and embeddings are generated in semantic companion field. Match queries on semantic_field get rewritten to neural. But match queries on original source_field are NOT yet rewritten.
+
+### disable_semantic_enrichment
+  1. Removes FieldReplacementProcessor from search pipeline (if present, in case
+     currently DEPLOYED — ensures query rewrite stops)
+  2. Calls PutMapping with status=DISABLED + _rename_active=false
+     (ensures rename is also disabled, full cleanup regardless of current state)
+  3. SemanticFieldProcessorFactory excludes DISABLED fields from processor config
+  4. Copy/rename processor stops for this field
+  Result: Full stop. No embeddings, no rename, no query rewrite. Safe from any state.
+  Can be called from ENRICHING or DEPLOYED — both result in clean DISABLED state.
+
+### deploy_semantic_enrichment
+  1. Enables rename ingest processor: renames source_field → semantic_field in doc
+     (app still sends {"title":"..."}, after rename it becomes {"title_semantic":"..."})
+  2. Disables copy ingest processor (no longer needed — data goes directly to
+     semantic field after rename)
+  3. Adds field_replacement_processor to search pipeline
+     (match on source_field → replaced with semantic_field → rewritten to neural)
+  Result: App sends same payload. Data goes directly to semantic field only.
+  Embeddings generated. Queries on source_field rewritten to neural.
+  Original text field no longer populated for new docs.
+
+### rollback_semantic_enrichment
+  1. Disables rename ingest processor (source_field goes back to text field)
+  2. Enables copy ingest processor (re-enables reading from source → embeddings)
+  3. Removes field_replacement_processor from search pipeline
+  Result: Back to enrichment mode. source_field populated as text (BM25 works).
+  Copy processor reads from source_field → generates embeddings.
+  Match queries on source_field are plain BM25 again.
+
+### list_semantic_enrichment (GET)
+  1. Reads index mapping, finds all semantic fields with source_field configured
+  2. Checks search pipeline state (which processors are present)
+  3. Checks ingest processor state (copy active vs rename active)
+  4. Returns current state for each field pair
+
+
+## Status Values and Lifecycle States
+
+### Mapping Status (stored in field mapping)
+Only two status values exist: ENABLED and DISABLED.
+- ENABLED: copy processor active, embeddings generated on ingest
+- DISABLED: copy processor stopped, no embeddings for new docs
+
+### Lifecycle States (derived, returned by list_semantic_enrichment)
+Three states exist, derived from the combination of status + _rename_active + pipeline:
+
+| State      | status  | _rename_active | field_replacement in pipeline | Meaning                        |
+|------------|---------|----------------|-------------------------------|--------------------------------|
+| ENRICHING  | ENABLED | false          | No                            | Embeddings generated via copy  |
+| DEPLOYED   | ENABLED | true           | Yes                           | Full switch: rename + rewrite  |
+| DISABLED   | DISABLED| false          | N/A                           | Stopped, no embeddings         |
+
+The state is NOT stored anywhere — it's computed from mapping + pipeline state.
+
+### How states are determined (list_semantic_enrichment logic):
+  - If status == DISABLED → state is DISABLED
+  - If _rename_active == true AND field_replacement_processor in pipeline → state is DEPLOYED
+  - Otherwise (status == ENABLED, no rename) → state is ENRICHING
+
+### Example list_semantic_enrichment response in each state:
+
+After enable_semantic_enrichment:
+{
+  "index": "my-index",
+  "fields": [{
+    "source_field": "title",
+    "semantic_field": "title_semantic",
+    "model_id": "abc123",
+    "model_type": "SPARSE",
+    "language": "ENGLISH",
+    "status": "ENABLED",
+    "state": "ENRICHING"
+  }]
+}
+
+After deploy_semantic_enrichment:
+{
+  "index": "my-index",
+  "fields": [{
+    "source_field": "title",
+    "semantic_field": "title_semantic",
+    "model_id": "abc123",
+    "model_type": "SPARSE",
+    "language": "ENGLISH",
+    "status": "ENABLED",
+    "state": "DEPLOYED"
+  }]
+}
+
+After disable_semantic_enrichment:
+{
+  "index": "my-index",
+  "fields": [{
+    "source_field": "title",
+    "semantic_field": "title_semantic",
+    "model_id": "abc123",
+    "model_type": "SPARSE",
+    "language": "ENGLISH",
+    "status": "DISABLED",
+    "state": "DISABLED"
+  }]
+}
+
+
+## Customer Workflow
+
+Phase 1 — ENRICHMENT (enable_semantic_enrichment):
+  Customer has index with text field "title". Calls enable API.
+  State: ENRICHING
+  Result:
+  - New docs ingested with {"title": "..."} get embeddings automatically
+  - Search pipeline created with rewrite processor for semantic_field
+  - Match queries on "title" still use BM25 (no field replacement)
+  - Match queries on "title_semantic" use neural (customer can test quality)
+  - Customer can compare BM25 vs neural by querying both fields
+
+Phase 2 — BACKFILL:
+  Customer runs _update_by_query to generate embeddings for existing docs.
+  Can be done in batches. State remains ENRICHING during backfill.
+
+Phase 3 — DEPLOY (deploy_semantic_enrichment):
+  After backfill is complete and quality is validated.
+  State: DEPLOYED
+  Result:
+  - Rename processor moves data directly into semantic field
+  - Copy processor disabled (not needed — data goes to semantic field directly)
+  - Field replacement in search pipeline active
+  - Match queries on "title" → replaced with "title_semantic" → rewritten to neural
+  - Original "title" text field no longer gets new data
+  - Customer's app unchanged — same queries, now uses semantic search
+
+ROLLBACK (rollback_semantic_enrichment):
+  If deployed quality is bad. Reverses deploy.
+  State: ENRICHING (back to Phase 1)
+  Result:
+  - Rename processor disabled — data goes back to "title" text field
+  - Copy processor re-enabled — embeddings generated from source_field
+  - Field replacement removed — match on "title" is BM25 again
+  - No data loss — just back to enrichment mode
+
+DISABLE (disable_semantic_enrichment):
+  Full stop. Can be called from ANY state (ENRICHING or DEPLOYED).
+  Performs full cleanup regardless of current state.
+  State: DISABLED
+  Result:
+  - FieldReplacementProcessor removed from pipeline (if present)
+  - Rename processor disabled (_rename_active=false)
+  - Copy processor stopped (status=DISABLED)
+  - No embeddings generated for new docs
+  - Existing embeddings preserved (not deleted)
+
+
+## State Diagram
+
+    enable_semantic_enrichment
+            │
+            ▼
+    ┌───────────────────┐
+    │    ENRICHING      │
+    │                   │
+    │ copy: active      │
+    │ rename: off       │
+    │ field_repl: off   │
+    │                   │
+    │ Queries on title: │
+    │   BM25            │
+    │ Queries on        │
+    │   title_semantic: │
+    │   neural          │
+    └───────────────────┘
+            │
+            │  deploy_semantic_enrichment
+            ▼
+    ┌───────────────────┐
+    │    DEPLOYED       │
+    │                   │
+    │ copy: off         │
+    │ rename: active    │
+    │ field_repl: active│
+    │                   │
+    │ Queries on title: │
+    │   → title_semantic│
+    │   → neural        │
+    └───────────────────┘
+            │
+            │  rollback_semantic_enrichment
+            ▼
+    ┌───────────────────┐
+    │    ENRICHING      │  (back to Phase 1)
+    └───────────────────┘
+
+    At any time (from ENRICHING or DEPLOYED):
+      disable_semantic_enrichment → DISABLED
+      (full cleanup: removes field replacement, disables rename, stops copy)
+
+    Invalid transitions (rejected by API):
+      deploy from DISABLED → 400 "field is DISABLED. Call enable first."
+      deploy from DEPLOYED → 400 "field is already DEPLOYED."
+
+    Note on direct PutMapping with status=DISABLED:
+      If customer directly calls PutMapping with status=DISABLED (bypassing API),
+      the system DOES respect it — SemanticFieldProcessorFactory sees DISABLED and
+      stops embedding generation. list_semantic_enrichment correctly shows DISABLED.
+
+      However, if the field was in DEPLOYED state, the FieldReplacementProcessor
+      and _rename_active=true remain in place. This means:
+      - Queries on source_field still get rewritten to neural
+      - But new docs have no embeddings (processor stopped)
+      - Result: poor search quality for new docs (rewritten to neural but no vectors)
+      - Customer will notice degraded results and should use the API to clean up
+
+      Customers should use disable_semantic_enrichment API which performs full cleanup.
+      Direct PutMapping is "at your own risk."
+
+      Future improvement: a cluster state listener could detect direct mapping changes
+      to semantic fields and auto-clean pipeline state. Not needed for POC.
+
+
+## Validation Rules
+
+| Check                                              | API                        | HTTP |
+|----------------------------------------------------|----------------------------|------|
+| source_field doesn't exist in index                | enable_semantic_enrichment | 400  |
+| source_field type not in compatible list           | enable_semantic_enrichment | 400  |
+| source_field already enriched by another field     | enable_semantic_enrichment | 400  |
+| semantic_field exists as non-semantic type         | enable_semantic_enrichment | 400  |
+| Index doesn't exist                               | all APIs                   | 404  |
+| semantic_field doesn't exist                       | deploy_semantic_enrichment | 400  |
+| semantic_field has no model_id                     | deploy_semantic_enrichment | 400  |
+| Non-ASE search pipeline already exists             | enable_semantic_enrichment | 400  |
+
+Compatible source_field types: text, keyword, match_only_text, wildcard, token_count, binary
+
+
+## Test Coverage
+
+test_semantic_enable_api.py — 10 tests:
+  A1.  enable_semantic_enrichment — creates field + pipeline + embeddings
+  A2.  disable_semantic_enrichment — stops embeddings
+  A3.  deploy_semantic_enrichment — rename + field replacement active
+  A4.  rollback_semantic_enrichment — undo deploy, copy mode restored
+  A5.  list_semantic_enrichment — returns field pairs with derived state
+  A6.  Multi-field: enable two fields in one call, both get embeddings + search
+  A7.  Validation: source_field not found → 400
+  A8.  Validation: incompatible type (boolean) → 400
+  R1.  Regression: semantic field (no API) — enable/disable/re-enable cycle
+  R2.  Regression: source_field with auto pipeline — full cycle
+
+
+## Key Design Points
+
+1. enable_semantic_enrichment creates the search pipeline immediately.
+   The pipeline has rewrite + two_phase from the start. Queries on the
+   semantic field get rewritten to neural right away.
+
+2. deploy_semantic_enrichment adds field_replacement_processor to the
+   existing pipeline AND enables rename in the ingest processor.
+   This is the "full switch" — queries on source_field now go neural.
+
+3. rollback_semantic_enrichment removes field_replacement_processor
+   AND disables rename. Back to copy mode + BM25 on source_field.
+
+4. No DEPLOYED status in mapping. Only ENABLED/DISABLED. The deploy state
+   is determined by _rename_active flag + pipeline state.
+
+5. source_field is metadata-only — marks the link between fields. It doesn't
+   change how the Option 3 source_field design works. It's immutable and
+   not customer-updatable.

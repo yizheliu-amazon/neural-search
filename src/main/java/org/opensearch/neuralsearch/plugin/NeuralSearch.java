@@ -128,6 +128,7 @@ import org.opensearch.neuralsearch.processor.rerank.RerankProcessor;
 import org.opensearch.neuralsearch.query.ext.RerankSearchExtBuilder;
 import org.opensearch.neuralsearch.query.ext.AgentStepsSearchExtBuilder;
 import org.opensearch.neuralsearch.rest.RestNeuralStatsAction;
+import org.opensearch.neuralsearch.rest.RestSemanticEnableHandler;
 import org.opensearch.neuralsearch.settings.NeuralSearchSettings;
 import org.opensearch.neuralsearch.sparse.SparseIndexEventListener;
 import org.opensearch.neuralsearch.sparse.SparseSettings;
@@ -142,6 +143,7 @@ import org.opensearch.neuralsearch.transport.NeuralSparseWarmupAction;
 import org.opensearch.neuralsearch.transport.NeuralSparseWarmupTransportAction;
 
 import org.opensearch.neuralsearch.action.SemanticSearchPipelineActionFilter;
+import org.opensearch.neuralsearch.processor.FieldReplacementProcessor;
 import org.opensearch.neuralsearch.processor.SemanticSearchRewriteProcessor;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.PipelineServiceUtil;
@@ -290,7 +292,15 @@ public class NeuralSearch extends Plugin
             NeuralSearchClusterUtil.instance().getClusterService(),
             indexNameExpressionResolver
         );
-        return ImmutableList.of(restNeuralStatsAction, restNeuralSparseWarmupCacheHandler, restNeuralSparseClearCacheHandler);
+        RestSemanticEnableHandler restSemanticEnableHandler = new RestSemanticEnableHandler(
+            NeuralSearchClusterUtil.instance().getClusterService()
+        );
+        return ImmutableList.of(
+            restNeuralStatsAction,
+            restNeuralSparseWarmupCacheHandler,
+            restNeuralSparseClearCacheHandler,
+            restSemanticEnableHandler
+        );
     }
 
     @Override
@@ -408,7 +418,9 @@ public class NeuralSearch extends Plugin
             AgenticQueryTranslatorProcessor.TYPE,
             new AgenticQueryTranslatorProcessor.Factory(clientAccessor, xContentRegistry, settingsAccessor),
             SemanticSearchRewriteProcessor.TYPE,
-            new SemanticSearchRewriteProcessor.Factory()
+            new SemanticSearchRewriteProcessor.Factory(),
+            FieldReplacementProcessor.TYPE,
+            new FieldReplacementProcessor.Factory()
         );
     }
 

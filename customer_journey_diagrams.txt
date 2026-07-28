@@ -1,0 +1,166 @@
+ASE Data Plane — Customer Experience / Journey Diagrams
+========================================================
+
+Guiding principle: Semantic enrichment is OPT-IN and INCREMENTAL. Customers
+should not have to learn/enable everything by default. The journey lets them
+(a) start simple, (b) optionally A/B test before committing, and (c) switch
+ingest/query behavior only when they are ready.
+
+
+============================================================
+USE CASE 1: New Index (CreateIndex)
+============================================================
+
+Console-driven journey for a brand-new index. Semantic field is declared up
+front; there is no legacy data to backfill and no app to keep compatible.
+
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  AWS CONSOLE                                                              │
+  │                                                                           │
+  │  (1) OpenSearch Service                                                   │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (2) Domain / Collection detail page                                     │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (3) Index list page  ──►  "Create index"                                │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (4) Define fields                                                        │
+  │        • regular fields (title: text, price: float, ...)                 │
+  │        • semantic field(s) (title_semantic: semantic)                    │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (5) [OPTIONAL] A/B testing on sampled data / existing S3 files          │
+  │        • compare sparse vs dense vs hybrid                               │
+  │        • measure relevance improvement, latency, cost                    │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (6) [OPTIONAL] Choose model type + query config                         │
+  │        • SPARSE / DENSE / hybrid (neural / neural_sparse / hybrid)       │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (7) Create index                                                        │
+  └────────────────────────────────┬──────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  DATA PLANE (ready immediately)                                          │
+  │                                                                           │
+  │  (8) Customer ingests + queries                                          │
+  │        • ingest doc → embeddings auto-generated for semantic field       │
+  │        • query semantic field → neural / neural_sparse / hybrid          │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+  Notes:
+   • No backfill step — the index is new, all docs are enriched on ingest.
+   • No "switch" step — the customer's app targets the semantic field from
+     day one (they designed the schema).
+   • A/B testing (step 5) is optional and happens BEFORE create, so the
+     customer commits to a model type/query config they already validated.
+
+
+============================================================
+USE CASE 2: Existing Index (add semantic search to live data)
+============================================================
+
+Console-driven journey for an index that already has data and a live app.
+The extra concerns vs. Use Case 1 are: (a) backfilling existing docs, and
+(b) switching ingest/query WITHOUT forcing an app code change.
+
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  AWS CONSOLE                                                              │
+  │                                                                           │
+  │  (1) OpenSearch Service                                                   │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (2) Domain / Collection detail page                                     │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (3) Existing index detail page                                          │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (4) Define enrichment                                                    │
+  │        • source field(s)  (optional) e.g. "title"                        │
+  │        • semantic field(s)           e.g. "title_semantic"               │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (5) [OPTIONAL] A/B testing on sampled data / existing S3 files          │
+  │        • compare sparse vs dense vs hybrid                               │
+  │        • measure relevance improvement, latency, cost                    │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (6) [OPTIONAL] Choose model type + query config + processors            │
+  │        │                                                                  │
+  │        ▼                                                                  │
+  │  (7) Update existing index (add semantic field via PutMapping)           │
+  │        • embeddings now generated for NEW docs (copy mode)               │
+  │        • existing app query on "title" still BM25 (unchanged)            │
+  └────────────────────────────────┬──────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  (8) Backfill existing docs                                              │
+  │        • _update_by_query re-runs ingest → embeddings for old docs       │
+  │        • customer can validate relevance on the real corpus              │
+  └────────────────────────────────┬──────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  (9) Switch ingestion / query   ──  TWO WAYS                             │
+  │                                                                           │
+  │   Option A: App-side change                                              │
+  │      • customer edits their code to target "title_semantic"              │
+  │      • full control, but requires an app deployment                      │
+  │                                                                           │
+  │   Option B: API-driven toggle (no app change)                            │
+  │      • call deploy_semantic_enrichment                                   │
+  │      • ingest pipeline: rename mode (title → title_semantic)             │
+  │      • search pipeline: FieldReplacementProcessor rewrites               │
+  │        query on "title" → "title_semantic" → neural                      │
+  │      • app keeps querying "title"; enrichment is transparent             │
+  │      • reversible via rollback_semantic_enrichment                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+  State progression (Option B, API-driven):
+
+     update index          backfill           deploy
+     (PutMapping)        (_update_by_query)   API call
+          │                    │                 │
+          ▼                    ▼                 ▼
+     ┌──────────┐         ┌──────────┐      ┌──────────┐
+     │ ENRICHING │───────►│ ENRICHING │─────►│ DEPLOYED  │
+     │ new docs  │        │ old docs  │      │ app query │
+     │ enriched  │        │ enriched  │      │ on source │
+     │ app: BM25 │        │ app: BM25 │      │ → neural  │
+     └──────────┘         └──────────┘      └────┬─────┘
+                                                  │ rollback
+                                                  ▼
+                                             ┌──────────┐
+                                             │ ENRICHING │
+                                             └──────────┘
+
+
+============================================================
+KEY DIFFERENCES BETWEEN THE TWO JOURNEYS
+============================================================
+
+  ┌────────────────────────┬─────────────────────┬────────────────────────┐
+  │ Concern                │ New Index (UC1)     │ Existing Index (UC2)   │
+  ├────────────────────────┼─────────────────────┼────────────────────────┤
+  │ Source field           │ N/A (schema fresh)  │ Optional (reuse text)  │
+  │ Backfill               │ Not needed          │ Required (old docs)    │
+  │ App compatibility      │ N/A (new app)       │ Must preserve OR       │
+  │                        │                     │ transparently switch   │
+  │ Switch ingest/query    │ Not needed          │ App change OR API      │
+  │ A/B testing            │ Optional, pre-create│ Optional, pre-deploy   │
+  │ Default behavior       │ Opt-in at design    │ Opt-in, incremental    │
+  └────────────────────────┴─────────────────────┴────────────────────────┘
+
+  Common thread: enrichment is never "all on by default." The customer
+  chooses when to enable it, optionally validates via A/B testing, and (for
+  existing indexes) controls exactly when the ingest/query switch happens.

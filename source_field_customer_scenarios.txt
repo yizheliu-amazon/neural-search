@@ -1,0 +1,105 @@
+source_field Customer Interaction Scenarios
+============================================
+
+## Index Creation
+
+| Scenario                                                              | Expected Behavior                          |
+|-----------------------------------------------------------------------|--------------------------------------------|
+| Create text field + semantic field with source_field pointing to it    | ALLOWED (main use case)                    |
+| source_field pointing to non-existent field in same mapping            | REJECT — target must exist                 |
+| source_field pointing to itself                                        | REJECT — circular                          |
+| source_field pointing to incompatible type (e.g., boolean, integer)    | REJECT — only text/keyword make sense      |
+| Two semantic fields pointing to same source (English + multilingual)   | Open question — see below                  |
+| Semantic field without source_field (normal mode)                      | ALLOWED                                    |
+
+## PutMapping
+
+| Scenario                                                              | Expected Behavior                          |
+|-----------------------------------------------------------------------|--------------------------------------------|
+| Add semantic field with source_field to existing index                 | ALLOWED                                    |
+| Change source_field from "title" to "description"                      | REJECT — immutable                         |
+| Add source_field to existing semantic field created without it          | REJECT                                     |
+| Remove source_field (omit it in partial PutMapping)                    | Preserve existing value (no change)        |
+| Toggle status ENABLED/DISABLED                                         | ALLOWED                                    |
+| Delete the source text field itself via some mapping change            | Should we block this? Orphans the semantic |
+
+## Ingestion
+
+| Scenario                                                              | Expected Behavior                          |
+|-----------------------------------------------------------------------|--------------------------------------------|
+| Ingest doc with source_field populated ({"title": "hello"})            | ALLOWED — embeddings generated             |
+| Ingest directly into semantic field ({"title_ase": "hello"})           | REJECT — "ingest into [title] instead"     |
+| Ingest doc with both source + semantic ({"title":"a","title_ase":"b"}) | REJECT — same reason                       |
+| Ingest doc WITHOUT source_field ({"category": "tech"})                 | Open question: skip silently or reject?    |
+| Ingest doc with source_field = null                                    | Skip embedding generation (no text)        |
+| Ingest doc with source_field = "" (empty string)                       | Skip embedding generation                  |
+| Update doc's source_field (re-index same doc ID)                       | Re-generate embeddings (normal path)       |
+| Bulk ingest                                                            | Works normally — each doc independent      |
+| Ingest when status=DISABLED                                            | ALLOWED — no embeddings, no processor      |
+
+## Query
+
+| Scenario                                                              | Expected Behavior                          |
+|-----------------------------------------------------------------------|--------------------------------------------|
+| match on source_field name ("title")                                   | Auto-rewritten to neural via pipeline      |
+| match on semantic field name ("title_ase")                             | Open question — rewrite or no-op?          |
+| term/range/exists on source_field                                      | NOT rewritten — only match queries         |
+| neural_sparse directly on embedding field                              | ALLOWED (power-user path)                  |
+| match on source_field when DISABLED                                    | Normal BM25 match (pipeline detached)      |
+| bool -> must -> match on source_field                                  | Rewrite the match clause inside bool       |
+| multi_match across source_field + other fields                         | Open question — partial rewrite?           |
+| Aggregations on source_field                                           | Not affected — works normally              |
+
+## Open Questions & Recommendations
+
+### 1. Doc missing the source_field entirely
+
+If customer ingests {"category": "tech"} without "title", should we:
+  (A) Skip silently — no embedding generated, doc indexed normally
+  (B) Reject — require source_field present when semantic is ENABLED
+
+Recommendation: (A) skip silently — customers may have heterogeneous docs.
+They can backfill later.
+
+### 2. Two semantic fields pointing to same source_field
+
+E.g., title_sparse: {source_field: "title", model_type: "sparse"}
+   + title_dense: {source_field: "title", model_type: "dense"}
+
+- Ingestion: both generate embeddings from "title" — works fine
+- Search pipeline: match on "title" -> which embedding to use?
+  Would need to rewrite to hybrid (both), or customer picks one.
+
+Recommendation: Allow it (multiple semantic fields per source), but the search
+pipeline maps source_field to first semantic field only, or uses hybrid.
+Customer can use explicit neural/neural_sparse queries for fine control.
+
+### 3. match on semantic field name ("title_ase")
+
+Options:
+  (A) Rewrite same as source_field — confusing since it's the same query
+  (B) Reject / error — "query [title] instead"
+  (C) No-op (return 0 results) — semantic field stores no indexed text
+
+Recommendation: (C) — it naturally returns nothing since there's no text
+indexed there. No special handling needed.
+
+### 4. multi_match across source_field + non-semantic fields
+
+E.g., multi_match: {query: "hello", fields: ["title", "description"]}
+where "title" has semantic but "description" doesn't.
+
+Options:
+  - Rewrite only the "title" portion -> complex decomposition
+  - Skip rewrite entirely for multi_match
+  - Reject
+
+Recommendation: Skip rewrite for multi_match in v1. Customer can restructure
+as bool query to get partial neural rewrite.
+
+### 5. Can source_field point to a nested/object field?
+
+E.g., source_field: "metadata.title" — dot-path into nested object.
+
+Recommendation: Reject in v1, only support top-level fields.
+Keeps implementation simple.

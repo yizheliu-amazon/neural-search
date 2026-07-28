@@ -1,0 +1,366 @@
+Design Doc — Option 3: source_field Parameter for Enabling ASE on Existing Fields
+==================================================================================
+
+## Summary
+
+Option 3 adds a `source_field` parameter to the semantic field type. When set,
+the semantic field reads text from an existing field (the source) for embedding
+generation, rather than expecting text directly ingested into itself. This enables
+ASE on existing text fields without requiring a type transition (text → semantic).
+
+Reference: https://chorus.aws.dev/doc/d444BsIjfyHk (Option 3 section)
+Branch: ase-source-field-poc
+
+
+## Customer Experience
+
+### Enable ASE on existing text field:
+
+```json
+// Existing index has "title" (text field) with data
+// Add semantic field pointing to "title" as source
+PUT /my-index/_mapping
+{
+  "properties": {
+    "title_ase": {
+      "type": "semantic",
+      "source_field": "title"
+    }
+  }
+}
+```
+
+After this:
+- New docs ingested with {"title": "..."} automatically get embeddings in
+  title_ase_semantic_info.embedding
+- Customer's existing ingestion code unchanged (still sends "title")
+- Old docs don't get embeddings until re-ingested or _update_by_query
+
+### Query:
+
+Match queries on "title" (source_field) are auto-rewritten to neural via
+the search pipeline that maps "title" → title_ase_semantic_info.embedding.
+
+```json
+// Customer's existing query — unchanged
+GET /my-index/_search
+{"query": {"match": {"title": "semantic search"}}}
+
+// Internally rewritten by search pipeline to:
+{"query": {"neural_sparse": {"title_ase_semantic_info.embedding": {"query_text": "semantic search"}}}}
+```
+
+### Disable/Re-enable:
+
+```json
+PUT /my-index/_mapping
+{
+  "properties": {
+    "title_ase": {"type": "semantic", "status": "DISABLED"}
+  }
+}
+// source_field preserved automatically (immutable param)
+```
+
+
+## What Was Implemented (POC)
+
+### Components Modified:
+
+1. **SemanticFieldMapper.java**
+   - Added `source_field` Parameter (updateable=true to avoid conflict on partial PutMapping)
+   - Added `preserveExistingParams()`: rejects changing source_field, rejects adding
+     source_field to field created without it, preserves null→existing for model_id/source_field
+
+2. **SemanticParameters.java**
+   - Added `sourceField` field
+
+3. **SemanticMappingTransformer.java**
+   - Added `validateSourceFields()`: validates source_field exists, compatible type,
+     no dot-path through nested
+   - Added `validateUniqueSourceFields()`: rejects two semantic fields pointing to same source
+   - Added `validateNoNestedSemanticFields()`: rejects semantic inside nested type (object OK)
+
+4. **SemanticFieldProcessorFactory.java**
+   - When source_field present: stores `_text_source_path` in config so processor reads from it
+   - Filters DISABLED fields from processor config
+
+5. **SemanticFieldProcessor.java**
+   - `getSemanticFieldInfo()`: when `_text_source_path` in config, reads text from source field
+   - Rejects if doc contains semantic field directly when source_field is configured
+
+6. **SemanticSearchPipelineActionFilter.java**
+   - Auto-creates search pipeline on CreateIndex/PutMapping
+   - When source_field configured: field_map key is source_field name (e.g., "title")
+     so that queries on the source field get rewritten
+   - Pipeline conflict detection (rejects if non-ASE default_pipeline exists)
+   - Detaches pipeline on DISABLED, re-attaches on ENABLED
+
+7. **SemanticSearchRewriteProcessor.java**
+   - Rewrites match queries to neural_sparse/neural based on field_map
+   - Handles bool, dismax, boosting, constant_score, function_score, hybrid
+
+
+### Key Behaviors:
+
+| Scenario                                     | Behavior                                    |
+|----------------------------------------------|---------------------------------------------|
+| Ingest {"title": "hello"}                    | Embeddings generated in companion field     |
+| Ingest {"title_ase": "hello"}                | REJECTED — "ingest into [title] instead"    |
+| Update title (re-index doc)                  | New embeddings generated                    |
+| Ingest without source_field in doc           | Skipped silently (no embedding)             |
+| source_field changed in PutMapping           | REJECTED — immutable                        |
+| source_field added to existing semantic field| REJECTED                                    |
+| Two semantic fields → same source_field      | REJECTED                                    |
+| source_field inside nested type              | REJECTED                                    |
+| source_field inside object type              | ALLOWED (dot-path traversal works)          |
+| source_field with dot-path (e.g. meta.title) | REJECTED (only top-level)                   |
+| status=DISABLED                              | No embeddings, pipeline detached            |
+| status=ENABLED (re-enable)                   | Embeddings resume, pipeline re-attached     |
+
+
+### Search Pipeline (auto-created):
+
+```json
+{
+  "request_processors": [
+    {
+      "semantic_search_rewrite_processor": {
+        "field_map": {
+          "title": {                          // KEY = source_field name
+            "type": "sparse",
+            "target_field": "title_ase_semantic_info.embedding",
+            "model_id": "abc123",
+            "analyzer": "bert-uncased"
+          }
+        }
+      }
+    },
+    {
+      "neural_sparse_two_phase_processor": {"enabled": true}
+    }
+  ]
+}
+```
+
+Note: field_map key is the SOURCE field name ("title"), not the semantic field
+name ("title_ase"). This is what enables auto-rewrite of customer's existing
+match queries on "title".
+
+
+### Validation Rules:
+
+| Validation                                        | Error Message                                              |
+|---------------------------------------------------|------------------------------------------------------------|
+| source_field empty                                | "source_field must not be empty"                           |
+| source_field doesn't exist in mapping             | Skipped (may exist from prior mapping)                     |
+| source_field incompatible type                    | "type [X] not compatible. Compatible: [text, keyword...]"  |
+| source_field contains "."                         | "cannot reference nested/object field path"                |
+| source_field traverses nested parent              | "traverses a nested mapping at [X]"                        |
+| Duplicate source_field (two semantic fields)      | "Multiple semantic fields [A] and [B] cannot share..."     |
+| Semantic field inside nested mapping              | "inside a nested mapping. Not supported."                  |
+| Change source_field value                         | "Cannot update parameter [source_field] from [A] to [B]"  |
+| Add source_field to field created without it      | "Cannot add [source_field] to existing semantic field..."  |
+| Direct ingest into semantic field w/ source_field | "has source_field [X] configured. Ingest into [X] instead" |
+
+
+### E2E Test Coverage (test_source_field.py — 19 tests):
+
+1.  Create index with source_field semantic field
+2.  Ingest docs into source_field → embeddings generated
+3.  Verify embeddings in companion field
+4.  Verify search pipeline maps source_field → embedding
+5.  Verify match query on source_field auto-rewritten
+6.  Reject direct ingest into semantic field
+7.  Status DISABLED stops embeddings + detaches pipeline
+8.  Status ENABLED re-enables embeddings + pipeline
+9.  Enable semantic on existing index with data
+10. source_field immutable (cannot change)
+11. Cannot add source_field to existing semantic field
+12. GET mapping correct at each stage
+13. Reject duplicate source_field (two semantic fields)
+14. Reject duplicate source_field via PutMapping
+15. Reject nested type semantic field
+16. Object semantic field works e2e
+17. Update title field regenerates embeddings when ENABLED
+18. Update title field does NOT regenerate when DISABLED
+19. Stale doc after re-enable, re-index fixes it
+
+
+## Mapping Example (after enable):
+
+```json
+{
+  "my-index": {
+    "mappings": {
+      "properties": {
+        "title": {"type": "text"},
+        "title_ase": {
+          "type": "semantic",
+          "model_id": "abc123",
+          "language": "ENGLISH",
+          "model_type": "SPARSE",
+          "status": "ENABLED",
+          "source_field": "title"
+        },
+        "title_ase_semantic_info": {
+          "properties": {
+            "embedding": {"type": "rank_features"},
+            "model": {
+              "properties": {
+                "id": {"type": "text", "index": false},
+                "name": {"type": "text", "index": false},
+                "type": {"type": "text", "index": false}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+
+## Comparison: Option 3 (source_field) vs Semantic Enable API
+
+### Customer Experience Comparison
+
+Option 3 — Customer enables ASE via PutMapping:
+```json
+// Step 1: Add semantic field (everything happens automatically)
+PUT /my-index/_mapping
+{"properties": {"title_ase": {"type": "semantic", "source_field": "title"}}}
+
+// Done. Search rewrite is immediately active. Embeddings start immediately.
+// Customer has no control over when queries get rewritten.
+```
+
+Semantic Enable API — Customer enables ASE via dedicated APIs:
+```json
+// Step 1: Enable enrichment (embeddings start, but queries on "title" NOT rewritten yet)
+POST /_plugins/_neural/semantic/my-index/enable_semantic_enrichment
+{"fields": [{"source_field": "title", "semantic_field": "title_semantic"}]}
+
+// Step 2: Customer tests quality by querying semantic field directly
+GET /my-index/_search
+{"query": {"match": {"title_semantic": "semantic search"}}}
+// Compares with existing BM25: GET /my-index/_search {"query": {"match": {"title": "..."}}}
+
+// Step 3: Backfill old docs
+POST /my-index/_update_by_query {"query": {"match_all": {}}}
+
+// Step 4: Deploy (queries on "title" now rewritten to neural)
+POST /_plugins/_neural/semantic/my-index/deploy_semantic_enrichment
+{"fields": [{"source_field": "title", "semantic_field": "title_semantic"}]}
+
+// Step 5: If bad — rollback instantly
+POST /_plugins/_neural/semantic/my-index/rollback_semantic_enrichment
+{"fields": [{"source_field": "title", "semantic_field": "title_semantic"}]}
+```
+
+### Customer Intuitiveness
+
+| Aspect                              | Option 3 (source_field)                    | Semantic Enable API                        |
+|-------------------------------------|--------------------------------------------|--------------------------------------------|
+| Learning curve                      | Low — just a PutMapping param              | Medium — new API endpoints to learn        |
+| Mental model                        | Confusing — "what is title_ase for?"       | Clear — "enable/deploy/rollback" verbs     |
+| When does search change?            | Immediately (surprise!)                    | Only after explicit deploy (customer ctrl) |
+| Can customer test before switching? | No (must disable to stop rewrite)          | Yes (ENRICHING state = test mode)          |
+| Rollback story                      | status=DISABLED (stops BOTH emb + search)  | rollback (stops search, keeps embeddings)  |
+| Discoverability                     | Hidden in mapping params                   | Explicit API with list endpoint            |
+| "What's happening on my index?"     | Must parse GET mapping                     | GET list_semantic_enrichment               |
+| Familiar pattern                    | "Like adding a field" (but not really)     | "Like a deployment pipeline"               |
+
+**Verdict on intuitiveness:**
+- Option 3 is SIMPLER to start (one API call) but CONFUSING in practice:
+  - Customer sees a ghost field (title_ase) they never interact with
+  - Search changes immediately with no way to test first
+  - "Why did my search results change?" after PutMapping
+- Semantic Enable API is MORE STEPS but CLEARER intent:
+  - Each step has a clear purpose and verb
+  - Customer is in control of when search behavior changes
+  - Explicit test phase before committing
+  - Easy rollback without stopping embeddings
+
+
+### Implementation Complexity Comparison
+
+| Dimension                          | Option 3 (source_field)                   | Semantic Enable API                        |
+|------------------------------------|-------------------------------------------|--------------------------------------------|
+| Changes to SemanticFieldMapper     | YES — new param, merge logic,             | NO — uses source_field as metadata only,   |
+|                                    | preserveExistingParams, immutability      | no special merge/validation logic needed   |
+|                                    | checks, updateable flag tricks            | beyond what Option 3 already added         |
+| Changes to SemanticMappingTransformer | YES — validateSourceFields,            | NO — no additional transformer changes     |
+|                                    | validateUniqueSourceFields,               |                                            |
+|                                    | validateNoNestedSemanticFields,           |                                            |
+|                                    | resolveFieldDef, dotpath validation       |                                            |
+| Changes to SemanticFieldProcessor  | YES — _text_source_path handling,         | MINIMAL — add _rename_source handling      |
+|                                    | rejection of direct ingest, dotpath       | (~15 lines) for deploy mode                |
+|                                    | traversal via getValueFromSourceByFullPath|                                            |
+| Changes to ProcessorFactory        | YES — _text_source_path setup,            | MINIMAL — _rename_active flag check        |
+|                                    | DISABLED filtering, dotpath computation   | (~5 lines)                                 |
+| ActionFilter (pipeline auto-create)| YES — SemanticSearchPipelineActionFilter   | NO — API creates pipeline explicitly       |
+|                                    | (~250 lines), intercepts CreateIndex +    | (no ActionFilter needed)                   |
+|                                    | PutMapping, conflict detection, detach    |                                            |
+|                                    | on DISABLED, re-attach on ENABLED         |                                            |
+| New components                     | SemanticSearchRewriteProcessor            | FieldReplacementProcessor (~100 lines)     |
+|                                    | SemanticSearchPipelineActionFilter        | RestSemanticEnableHandler (~500 lines)     |
+|                                    | (both ~200+ lines each)                   |                                            |
+| Coupling to semantic field internals| HIGH — modifies mapper, transformer,     | LOW — REST handler orchestrates existing   |
+|                                    | processor, factory, adds ActionFilter     | components without modifying their logic   |
+| Risk of breaking existing behavior | MEDIUM — mapper merge logic is tricky,    | LOW — only adds new code paths, doesn't    |
+|                                    | ActionFilter intercepts all CreateIndex/  | modify existing semantic field behavior    |
+|                                    | PutMapping globally                       |                                            |
+| Testability                        | Complex — many edge cases in merge,       | Simple — each API is independent,          |
+|                                    | immutability, ActionFilter timing         | easy to test in isolation                  |
+
+**Verdict on complexity:**
+- Option 3 deeply modifies the semantic field's internal machinery (mapper, transformer,
+  processor, factory) and adds a global ActionFilter. Every component of the semantic
+  field is touched. This increases risk of regressions and makes the codebase harder
+  to understand.
+- Semantic Enable API is mostly a NEW layer on top. It adds:
+  - One REST handler (orchestration only — calls PutMapping + pipeline APIs)
+  - One simple search processor (FieldReplacementProcessor, ~100 lines)
+  - Minimal changes to existing code (_rename_active flag, ~20 lines total)
+  The semantic field itself (mapper, transformer, processor) stays mostly unchanged.
+  The API is a "control plane" over the existing data plane.
+
+### Summary
+
+| Criterion               | Option 3          | Semantic Enable API |
+|-------------------------|-------------------|---------------------|
+| Steps to enable         | 1 (PutMapping)    | 2-4 (enable+deploy) |
+| Customer control        | Low               | High                |
+| Risk of surprise        | High (immediate)  | Low (explicit)      |
+| Gradual rollout         | No                | Yes                 |
+| Complexity added to     | Semantic field    | New REST layer      |
+|   existing code         |   internals       |   (minimal coupling)|
+| Lines modified in       | ~500 across 5     | ~20 across 2 files  |
+|   existing files        |   core files      |                     |
+| New code                | ~450 lines        | ~800 lines          |
+| Risk of regression      | Medium-High       | Low                 |
+| Customer intuitiveness  | Simple start,     | More steps,         |
+|                         |   confusing later  |   clear throughout |
+
+
+## Relationship to the Enable API Design
+
+The Semantic Enable API (branch: ase-semantic-enable-api) builds ON TOP of
+Option 3 internally. The API:
+- Uses source_field as metadata linking source to semantic field
+- Uses the same SemanticFieldProcessor copy behavior
+- Uses the same SemanticSearchRewriteProcessor
+- Adds FieldReplacementProcessor for deploy (source_field → semantic_field in query)
+- Adds _rename_active for deploy (source_field → semantic_field in doc)
+
+Option 3 is the foundation. The API adds lifecycle management on top.
+
+However, the API approach does NOT require the full Option 3 complexity:
+- The ActionFilter (auto pipeline creation/detachment) is replaced by explicit API calls
+- The source_field validation complexity is simplified (API validates before calling PutMapping)
+- The mapper merge complexity (preserveExistingParams) is still needed but only for
+  the _rename_active toggle, not for the full source_field immutability dance
+- The "reject direct ingest" behavior is optional when using the API (customer uses
+  the API to manage state, not direct field access)

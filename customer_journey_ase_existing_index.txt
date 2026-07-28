@@ -1,0 +1,770 @@
+Customer Journey: Enabling ASE (Automatic Semantic Enrichment) on an Existing Index
+====================================================================================
+
+Scenario: A customer has a production index "products" with millions of documents.
+They want to add semantic search capabilities WITHOUT changing their existing application code.
+
+================================================================================
+STEP 1: STARTING STATE
+================================================================================
+
+Index mapping:
+    PUT /products
+    {
+      "mappings": {
+        "properties": {
+          "title": { "type": "text" },
+          "description": { "type": "text" },
+          "category": { "type": "keyword" },
+          "price": { "type": "float" },
+          "sku": { "type": "keyword" }
+        }
+      }
+    }
+
+Existing application queries (simplified):
+    // Search by title
+    GET /products/_search
+    {
+      "query": {
+        "match": {
+          "title": "wireless noise cancelling headphones"
+        }
+      }
+    }
+
+    // Search by description
+    GET /products/_search
+    {
+      "query": {
+        "bool": {
+          "must": [
+            { "match": { "description": "comfortable for long flights" } }
+          ],
+          "filter": [
+            { "term": { "category": "electronics" } }
+          ]
+        }
+      }
+    }
+
+Document count: ~5 million documents
+Ingestion rate: ~10,000 docs/day via bulk API
+Application: REST service calling OpenSearch, no plans to modify code immediately
+
+================================================================================
+STEP 2: DISCOVERY
+================================================================================
+
+Customer learns about ASE and realizes:
+- They can add semantic search to existing text fields
+- No application code changes required for basic adoption
+- They can test quality before switching live traffic
+- Rollback is instant if results are worse
+
+Key value proposition: "Match queries automatically become neural queries"
+This means their existing app queries like:
+    {"match": {"title": "noise cancelling headphones"}}
+Will automatically leverage semantic understanding to also find:
+    - "wireless earbuds with ANC" (synonym understanding)
+    - "bluetooth headset quiet mode" (semantic similarity)
+    - "over-ear audio device sound isolation" (concept matching)
+
+================================================================================
+STEP 3: ENABLE ASE — ENRICHMENT ONLY (NO SEARCH IMPACT YET)
+================================================================================
+
+Enable semantic enrichment for the "title" field:
+
+    POST /_plugins/_neural/semantic/products/enable
+    {
+      "source_field": "title",
+      "semantic_field": "title_semantic",
+      "language": "ENGLISH",
+      "model_type": "SPARSE"
+    }
+
+    Response:
+    {
+      "acknowledged": true,
+      "index": "products",
+      "source_field": "title",
+      "semantic_field": "title_semantic",
+      "model_id": "abc123-sparse-en",
+      "status": "ENABLED"
+    }
+
+Enable semantic enrichment for the "description" field:
+
+    POST /_plugins/_neural/semantic/products/enable
+    {
+      "source_field": "description",
+      "semantic_field": "desc_semantic",
+      "language": "ENGLISH",
+      "model_type": "SPARSE"
+    }
+
+    Response:
+    {
+      "acknowledged": true,
+      "index": "products",
+      "source_field": "description",
+      "semantic_field": "desc_semantic",
+      "model_id": "abc123-sparse-en",
+      "status": "ENABLED"
+    }
+
+What happens:
+- A semantic companion field is added to the mapping
+- The model is resolved and assigned (or pre-deployed on managed service)
+- NO impact on existing queries — search still uses BM25
+- NO impact on existing documents — they remain unchanged
+- New documents ingested AFTER this point will automatically get embeddings
+
+Timing estimate: ~1 second (API call), instant on managed service
+
+IMPORTANT: At this point:
+- Existing 5M docs: NO embeddings (unchanged)
+- New docs ingested after enable: HAVE embeddings
+- Search behavior: UNCHANGED (still BM25)
+- Application: UNAFFECTED
+
+================================================================================
+STEP 4: ONGOING INGESTION — NEW DOCS GET EMBEDDINGS AUTOMATICALLY
+================================================================================
+
+Customer continues normal ingestion. No code change needed:
+
+    POST /products/_bulk
+    {"index": {"_id": "prod-5000001"}}
+    {"title": "Sony WH-1000XM5 Headphones", "description": "Industry-leading noise cancellation with Auto NC Optimizer", "category": "electronics", "price": 349.99, "sku": "SONY-WH1000XM5"}
+    {"index": {"_id": "prod-5000002"}}
+    {"title": "Apple AirPods Max", "description": "High-fidelity audio with active noise cancellation and spatial audio", "category": "electronics", "price": 549.00, "sku": "AAPL-AIRPODMAX"}
+
+Behind the scenes, the SemanticFieldProcessor automatically:
+1. Reads the "title" text from the document
+2. Generates sparse embeddings via the resolved model
+3. Stores embeddings in title_semantic_semantic_info.embedding
+4. Same for "description" -> desc_semantic_semantic_info.embedding
+
+The document is indexed with both the original text fields AND the new embeddings.
+
+Performance impact on ingestion:
+- Additional latency per doc: ~20-50ms (model inference)
+- Bulk ingestion throughput may decrease ~10-20%
+- Best practice: If bulk-loading large batches, consider increasing bulk timeout
+
+Timing estimate: Ongoing. Within 1-2 days, the customer has ~10K-20K new docs
+with embeddings alongside the 5M existing docs without.
+
+================================================================================
+STEP 5: TESTING QUALITY — COMPARE SEMANTIC vs BM25
+================================================================================
+
+Customer creates a test set of queries to evaluate quality. They query the
+semantic embedding field DIRECTLY using neural_sparse queries (bypassing the
+application entirely — this is manual testing).
+
+Test query 1 — Semantic search on title:
+
+    GET /products/_search
+    {
+      "query": {
+        "neural_sparse": {
+          "title_semantic_semantic_info.embedding": {
+            "query_text": "noise cancelling headphones",
+            "model_id": "abc123-sparse-en"
+          }
+        }
+      },
+      "size": 10
+    }
+
+Test query 2 — Compare with existing BM25:
+
+    GET /products/_search
+    {
+      "query": {
+        "match": {
+          "title": "noise cancelling headphones"
+        }
+      },
+      "size": 10
+    }
+
+Test query 3 — Semantic advantage case (paraphrase/synonym):
+
+    GET /products/_search
+    {
+      "query": {
+        "neural_sparse": {
+          "title_semantic_semantic_info.embedding": {
+            "query_text": "headset that blocks outside sounds"
+          }
+        }
+      },
+      "size": 10
+    }
+
+    (BM25 "match" would struggle here — no keyword overlap with "noise cancelling")
+
+Test query 4 — Description semantic search:
+
+    GET /products/_search
+    {
+      "query": {
+        "neural_sparse": {
+          "desc_semantic_semantic_info.embedding": {
+            "query_text": "comfortable for travel and commute"
+          }
+        }
+      },
+      "size": 10
+    }
+
+Evaluation approach:
+- Run 50-100 representative queries from production logs
+- Compare top-10 results between BM25 and semantic
+- Use manual relevance judgments or click-through data
+- Key metrics: NDCG@10, Precision@5, Mean Reciprocal Rank
+
+NOTE: Only documents with embeddings (new docs since Step 3) will appear in
+neural_sparse results. This is fine for quality testing — just ensure enough
+test docs exist with embeddings.
+
+Timing estimate: 1-3 days for evaluation depending on query set size
+
+================================================================================
+STEP 6: DECISION POINT — ADJUST IF NEEDED
+================================================================================
+
+If quality looks GOOD: proceed to Step 7 (backfill).
+
+If quality looks BAD or MEDIOCRE, customer can adjust:
+
+Option A — Switch to dense model:
+
+    // First, the existing semantic field uses sparse. To try dense,
+    // enable a second semantic field with dense model:
+    POST /_plugins/_neural/semantic/products/enable
+    {
+      "source_field": "title",
+      "semantic_field": "title_dense_semantic",
+      "language": "ENGLISH",
+      "model_type": "DENSE"
+    }
+
+    // Test with neural query (k-NN):
+    GET /products/_search
+    {
+      "query": {
+        "neural": {
+          "title_dense_semantic_semantic_info.embedding": {
+            "query_text": "noise cancelling headphones",
+            "model_id": "def456-dense-en"
+          }
+        }
+      },
+      "size": 10
+    }
+
+Option B — Try multilingual model (if content is mixed-language):
+
+    POST /_plugins/_neural/semantic/products/enable
+    {
+      "source_field": "description",
+      "semantic_field": "desc_multilingual_semantic",
+      "language": "MULTILINGUAL",
+      "model_type": "SPARSE"
+    }
+
+Option C — Hybrid approach (test combining BM25 + neural):
+
+    GET /products/_search
+    {
+      "query": {
+        "hybrid": {
+          "queries": [
+            { "match": { "title": "noise cancelling headphones" } },
+            { "neural_sparse": { "title_semantic_semantic_info.embedding": { "query_text": "noise cancelling headphones" } } }
+          ]
+        }
+      }
+    }
+
+Timing estimate: 1-5 days depending on iteration cycles
+
+================================================================================
+STEP 7: BACKFILL — GENERATE EMBEDDINGS FOR EXISTING DOCUMENTS
+================================================================================
+
+Once quality is validated, backfill existing documents so they also have embeddings.
+This uses _update_by_query which re-processes documents through the ingest pipeline.
+
+Option A — Full backfill (all 5M docs):
+
+    POST /products/_update_by_query?wait_for_completion=false
+    {
+      "query": {
+        "bool": {
+          "must_not": {
+            "exists": {
+              "field": "title_semantic_semantic_info.embedding"
+            }
+          }
+        }
+      }
+    }
+
+    Response:
+    {
+      "task": "node1:12345"
+    }
+
+    // Monitor progress:
+    GET /_tasks/node1:12345
+    {
+      "completed": false,
+      "task": {
+        "status": {
+          "total": 5000000,
+          "updated": 1250000,
+          "created": 0,
+          "deleted": 0
+        }
+      }
+    }
+
+Option B — Batched backfill (recommended for production):
+
+    // Batch 1: First million docs by category
+    POST /products/_update_by_query?wait_for_completion=false&scroll_size=500
+    {
+      "query": {
+        "bool": {
+          "must": [
+            { "term": { "category": "electronics" } }
+          ],
+          "must_not": [
+            { "exists": { "field": "title_semantic_semantic_info.embedding" } }
+          ]
+        }
+      }
+    }
+
+    // Batch 2: Next category
+    POST /products/_update_by_query?wait_for_completion=false&scroll_size=500
+    {
+      "query": {
+        "bool": {
+          "must": [
+            { "term": { "category": "clothing" } }
+          ],
+          "must_not": [
+            { "exists": { "field": "title_semantic_semantic_info.embedding" } }
+          ]
+        }
+      }
+    }
+
+Option C — Throttled backfill (minimal production impact):
+
+    POST /products/_update_by_query?wait_for_completion=false&requests_per_second=1000
+    {
+      "query": {
+        "bool": {
+          "must_not": {
+            "exists": {
+              "field": "title_semantic_semantic_info.embedding"
+            }
+          }
+        }
+      }
+    }
+
+Best practices for backfill:
+- Use wait_for_completion=false for large indices (async task)
+- Use requests_per_second to throttle and limit cluster load
+- Run during off-peak hours
+- Monitor cluster health (CPU, heap, search latency) during backfill
+- Backfill in batches if index is very large (>10M docs)
+- Use scroll_size to control memory usage per batch
+
+Timing estimates:
+- 5M docs at 1000 docs/sec (throttled): ~83 minutes
+- 5M docs at 5000 docs/sec (moderate): ~17 minutes
+- 5M docs unthrottled on large cluster: ~5-10 minutes
+- Consider model inference adds ~30-50ms per doc
+
+Verification — check backfill progress:
+
+    // Count docs with embeddings:
+    GET /products/_count
+    {
+      "query": {
+        "exists": {
+          "field": "title_semantic_semantic_info.embedding"
+        }
+      }
+    }
+
+    // Count docs WITHOUT embeddings:
+    GET /products/_count
+    {
+      "query": {
+        "bool": {
+          "must_not": {
+            "exists": {
+              "field": "title_semantic_semantic_info.embedding"
+            }
+          }
+        }
+      }
+    }
+
+================================================================================
+STEP 8: ENABLE SEARCH SWITCH — AUTOMATIC QUERY REWRITING
+================================================================================
+
+Once backfill is complete (or has sufficient coverage, e.g., >90% of docs have
+embeddings), enable the search rewrite for the title field:
+
+    POST /_plugins/_neural/semantic/products/enable_search
+    {
+      "source_field": "title",
+      "semantic_field": "title_semantic"
+    }
+
+    Response:
+    {
+      "acknowledged": true,
+      "index": "products",
+      "pipeline": "products-semantic-search-pipeline",
+      "field_map": {
+        "title": {
+          "type": "sparse",
+          "target_field": "title_semantic_semantic_info.embedding",
+          "model_id": "abc123-sparse-en"
+        }
+      }
+    }
+
+What happens internally:
+1. A search pipeline with a semantic_search_rewrite_processor is created
+2. The pipeline is set as index.search.default_pipeline on the "products" index
+3. All incoming match queries on "title" are now rewritten to neural_sparse queries
+
+BEFORE enable_search — application sends:
+    {"query": {"match": {"title": "wireless headphones"}}}
+    OpenSearch executes: BM25 match on "title"
+
+AFTER enable_search — same application query, no code change:
+    {"query": {"match": {"title": "wireless headphones"}}}
+    OpenSearch rewrites to: neural_sparse on title_semantic_semantic_info.embedding
+    Customer's application is COMPLETELY UNAWARE of the rewrite
+
+What queries get rewritten:
+- match on "title"                       -> REWRITTEN to neural_sparse
+- bool > must > match on "title"         -> REWRITTEN (match clause inside bool)
+- term/range/exists on "title"           -> NOT rewritten (only match queries)
+- match on "description"                 -> NOT rewritten (search not enabled for this field yet)
+- match on "category"                    -> NOT rewritten (no semantic field for this)
+- multi_match across multiple fields     -> NOT rewritten in v1
+
+IMPORTANT: Documents without embeddings (if backfill is incomplete) will NOT
+appear in neural search results. Ensure sufficient coverage before enabling.
+
+Timing estimate: ~1 second (API call). Search behavior changes IMMEDIATELY.
+
+================================================================================
+STEP 9: MONITORING — OBSERVE IMPACT
+================================================================================
+
+Customer should monitor the following metrics after enabling search:
+
+A. Relevance metrics:
+    - Click-through rate on search results (if available)
+    - Add-to-cart rate from search
+    - Zero-result query rate
+    - Query refinement rate (users searching again)
+
+B. Latency metrics:
+    // Check search latency percentiles
+    GET /products/_stats/search
+
+    // Compare p50, p95, p99 latency before/after
+    // Neural search typically adds 10-30ms per query vs pure BM25
+
+C. Error rates:
+    // Check for rejected queries or timeouts
+    GET /_nodes/stats/thread_pool/search
+
+    // Monitor model inference errors (if any)
+    GET /_plugins/_ml/models/abc123-sparse-en/_stats
+
+D. Coverage verification:
+    // Ensure new docs continue getting embeddings
+    GET /products/_count
+    {
+      "query": {
+        "bool": {
+          "must_not": {
+            "exists": { "field": "title_semantic_semantic_info.embedding" }
+          }
+        }
+      }
+    }
+
+    // This should only decrease (or stay near zero) over time
+
+E. A/B testing approach (if application supports it):
+    - Route 10% of traffic to neural (enable_search on test index alias)
+    - Compare conversion metrics
+    - Gradually increase traffic percentage
+
+Expected performance characteristics:
+- Latency increase: 10-50ms per query (model inference on query side)
+- Relevance improvement: 5-15% NDCG improvement on semantic queries
+- Zero-result reduction: 20-40% fewer zero-result queries (semantic matching)
+- Storage increase: ~10-20% (sparse embeddings per document)
+
+Timing estimate: Monitor for 1-2 weeks before declaring success
+
+================================================================================
+STEP 10: ROLLBACK — INSTANT REVERT IF ISSUES ARISE
+================================================================================
+
+If latency is too high, relevance is worse, or errors occur:
+
+    POST /_plugins/_neural/semantic/products/disable_search
+    {
+      "source_field": "title",
+      "semantic_field": "title_semantic"
+    }
+
+    Response:
+    {
+      "acknowledged": true,
+      "index": "products",
+      "pipeline_removed": true
+    }
+
+Effect is IMMEDIATE:
+- All match queries on "title" revert to BM25
+- No application code change needed
+- Embeddings CONTINUE being generated for new documents
+- Existing embeddings are preserved (not deleted)
+- Customer can re-enable search later after fixing issues
+
+Rollback scenarios:
+1. Latency too high -> disable_search, investigate model performance
+2. Relevance worse -> disable_search, try different model_type or language
+3. Partial backfill causing missing results -> disable_search, complete backfill, re-enable
+4. Model errors -> disable_search, check model health, re-enable when fixed
+
+After fixing the issue, re-enable with the same call:
+    POST /_plugins/_neural/semantic/products/enable_search
+    {
+      "source_field": "title",
+      "semantic_field": "title_semantic"
+    }
+
+Timing estimate: <1 second to rollback. Instant effect on search behavior.
+
+================================================================================
+STEP 11: FULL ADOPTION — EXPAND TO MORE FIELDS
+================================================================================
+
+Once title search is stable and improved, enable search for description too:
+
+    // Ensure backfill is complete for description field
+    GET /products/_count
+    {
+      "query": {
+        "bool": {
+          "must_not": {
+            "exists": { "field": "desc_semantic_semantic_info.embedding" }
+          }
+        }
+      }
+    }
+    // Should return 0 (all docs have description embeddings)
+
+    // Enable search rewrite for description
+    POST /_plugins/_neural/semantic/products/enable_search
+    {
+      "source_field": "description",
+      "semantic_field": "desc_semantic"
+    }
+
+    Response:
+    {
+      "acknowledged": true,
+      "index": "products",
+      "pipeline": "products-semantic-search-pipeline",
+      "field_map": {
+        "title": {
+          "type": "sparse",
+          "target_field": "title_semantic_semantic_info.embedding",
+          "model_id": "abc123-sparse-en"
+        },
+        "description": {
+          "type": "sparse",
+          "target_field": "desc_semantic_semantic_info.embedding",
+          "model_id": "abc123-sparse-en"
+        }
+      }
+    }
+
+Now BOTH title and description match queries are automatically rewritten.
+
+Application query (unchanged):
+    GET /products/_search
+    {
+      "query": {
+        "bool": {
+          "must": [
+            { "match": { "description": "comfortable for long flights" } }
+          ],
+          "filter": [
+            { "term": { "category": "electronics" } }
+          ]
+        }
+      }
+    }
+
+What OpenSearch does:
+    - Rewrites the match on "description" to neural_sparse
+    - Keeps the term filter on "category" unchanged
+    - Returns semantically relevant results
+
+Advanced: Application-side hybrid queries (optional future enhancement):
+    // If customer wants BOTH BM25 and neural for maximum recall:
+    GET /products/_search
+    {
+      "query": {
+        "hybrid": {
+          "queries": [
+            {
+              "bool": {
+                "must": [
+                  { "match": { "title": "wireless headphones" } }
+                ],
+                "filter": [
+                  { "term": { "category": "electronics" } }
+                ]
+              }
+            },
+            {
+              "neural_sparse": {
+                "title_semantic_semantic_info.embedding": {
+                  "query_text": "wireless headphones",
+                  "model_id": "abc123-sparse-en"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "search_pipeline": {
+        "phase_results_processors": [
+          {
+            "normalization-processor": {
+              "normalization": { "technique": "min_max" },
+              "combination": { "technique": "arithmetic_mean", "parameters": { "weights": [0.4, 0.6] } }
+            }
+          }
+        ]
+      }
+    }
+
+    This requires an application code change but gives the best of both worlds.
+
+================================================================================
+SUMMARY TIMELINE
+================================================================================
+
+Day 0:      Enable ASE enrichment (Step 3)           — 1 second
+Days 1-3:   Accumulate new docs with embeddings      — Automatic
+Days 3-5:   Test quality with neural queries (Step 5) — Manual evaluation
+Day 5:      Decision: proceed or adjust (Step 6)     — 1 day
+Day 6:      Start backfill (Step 7)                  — 1-2 hours (throttled)
+Day 6:      Verify backfill complete                 — Minutes
+Day 6:      Enable search switch (Step 8)            — 1 second
+Days 6-20:  Monitor (Step 9)                         — 2 weeks
+Day 20:     If stable, enable description too (Step 11)
+Day 34:     Full adoption confirmed
+
+Total time to full adoption: ~5 weeks (conservative)
+Total time to first value: ~1 week (title semantic search live)
+
+================================================================================
+BEST PRACTICES
+================================================================================
+
+1. ALWAYS test before enabling search:
+   - Never go directly from enable -> enable_search without testing quality
+   - Use at least 50 representative queries from production logs
+
+2. BACKFILL BEFORE enabling search:
+   - Documents without embeddings will not appear in neural results
+   - Ensure >95% coverage before switching live traffic
+
+3. MONITOR after enabling search:
+   - Set up dashboards for p50/p95 latency, error rate, and zero-result rate
+   - Have runbook ready for disable_search rollback
+
+4. START with one field:
+   - Enable title first (shorter text, more predictable)
+   - Add description once title is proven
+
+5. USE SPARSE for text search:
+   - Sparse models (neural_sparse) are generally better for keyword-like queries
+   - Dense models (neural/knn) better for conceptual/similarity search
+   - Start with SPARSE for most search-box use cases
+
+6. THROTTLE backfill in production:
+   - Use requests_per_second parameter
+   - Run during off-peak hours
+   - Monitor cluster health during backfill
+
+7. CONSIDER coverage:
+   - It is OK to enable search with partial backfill if:
+     * Recent docs are more important (e-commerce: new products matter more)
+     * You accept that old docs may rank lower temporarily
+   - For complete recall over all docs, wait for 100% backfill
+
+8. PLAN for storage:
+   - Sparse embeddings add ~10-20% storage overhead
+   - Dense embeddings add ~5-10% for high-dim vectors
+   - Ensure cluster has headroom before backfill
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Issue: "source_field [title] does not exist in index [products]"
+Fix: Verify field name matches exactly (case-sensitive)
+
+Issue: "source_field [title] already enriched by [another_field]"
+Fix: Only one semantic field per source field for search rewrite.
+     Remove the other enrichment first if switching.
+
+Issue: Backfill is slow
+Fix: Increase requests_per_second, add data nodes, or use async with
+     wait_for_completion=false and monitor via _tasks API
+
+Issue: Neural search returning fewer results than BM25
+Fix: Check embedding coverage (count docs with/without embeddings).
+     Likely backfill is incomplete.
+
+Issue: Latency spike after enable_search
+Fix: Model inference on query side. Check model stats.
+     Consider enabling model cache warmup or scaling ML nodes.
+
+Issue: Relevance is worse with neural than BM25
+Fix: disable_search (instant rollback). Evaluate:
+     - Are queries very keyword-specific (SKU, exact product name)?
+       Neural may not help here. Keep BM25 for exact-match fields.
+     - Try hybrid approach instead of pure neural replacement.
+     - Try different model_type (DENSE vs SPARSE).

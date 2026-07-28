@@ -1,0 +1,259 @@
+Semantic Enrichment API Design — Enabling ASE on Existing Text Fields
+======================================================================
+
+## Overview
+
+Instead of using source_field on the semantic field type, provide explicit APIs
+that let customers:
+1. Enrich an existing text field with a semantic companion field
+2. Toggle search query rewriting on/off to gradually roll out semantic search
+
+## Decision: API Path
+
+Chosen: POST /_plugins/_neural/semantic/{index}/enable
+  - Under existing plugin base URI (/_plugins/_neural) — no Core change needed
+  - Follows existing pattern: /_plugins/_neural/warmup/{index}, /clear_cache/{index}
+  - Index-scoped via path param
+
+Rejected alternatives:
+- POST /_plugins/_neural/enrich_field         — no Core change, same effort
+- POST /_plugins/_neural/enable_semantic      — no Core change, same effort
+- POST /_plugins/_neural/semantic_link        — no Core change, same effort
+- POST /_plugins/_neural/create_enrichment    — no Core change, same effort
+- POST /{index}/_semantic/enable              — REQUIRES Core change (route namespace)
+
+All /_plugins/_neural/* options are identical effort (just a BaseRestHandler in
+neural-search plugin). The /{index}/_semantic/enable option requires Core to
+register the _semantic action namespace in the REST dispatcher — higher effort.
+
+## API 1: Enable Semantic Enrichment
+
+POST /_plugins/_neural/semantic/{index}/enable_semantic_enrichment
+{
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic", "language": "ENGLISH", "model_type": "SPARSE"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic", "model_id": "abc123", "status": "ENABLED"},
+    {"source_field": "description", "semantic_field": "desc_semantic", "model_id": "abc123", "status": "ENABLED"}
+  ]
+}
+
+### What it does internally:
+1. Validates:
+   - source_field exists in mapping
+   - source_field type is in [text, keyword, match_only_text, wildcard, token_count, binary]
+   - No other semantic field already enriches this source_field
+   - semantic_field doesn't already exist (or exists and is compatible)
+2. Resolves model_id via SemanticModelResolver (language + model_type)
+3. Creates the semantic field in mapping via PutMapping (with source_field + model_id)
+   → Triggers SemanticMappingTransformer → creates companion field
+4. SemanticFieldProcessor automatically picks up the new field on next ingest
+   (reads text from source_field, generates embeddings)
+
+### Ingest approach evaluation:
+
+Option A: System-generated ingest processor (like current SemanticFieldProcessor)
+  Pros:
+  - No visible pipeline for customer to accidentally delete/modify
+  - Consistent with existing semantic field behavior
+  - Plugin-managed lifecycle
+  Cons:
+  - Customer can't see it in GET _ingest/pipeline
+  - Harder to debug
+  - Can't be combined with customer's own ingest pipeline easily (conflict)
+
+Option B: Default ingest pipeline
+  Pros:
+  - Visible, debuggable (GET _ingest/pipeline shows it)
+  - Customer understands the concept
+  - Can coexist with customer pipelines via pipeline chaining (final_pipeline)
+  Cons:
+  - Customer could accidentally modify/delete it
+  - Conflicts if customer already has a default_pipeline set on the index
+  - Need naming convention to avoid collisions
+
+Option C: Final pipeline (index.final_pipeline)
+  Pros:
+  - Runs AFTER customer's default_pipeline — no conflict
+  - Customer can have their own default_pipeline
+  - Still visible for debugging
+  Cons:
+  - final_pipeline can also conflict if customer sets one
+  - Requires OpenSearch 2.x+ (available)
+
+Decision: System-generated ingest processor (Option A)
+  Why:
+  - This is what the semantic field already uses (SemanticFieldProcessor)
+  - No conflict with customer pipelines
+  - No new "copy processor" needed — the SemanticFieldProcessor already reads
+    from the source field and generates embeddings when source_field is configured.
+  - The API is orchestration over PutMapping + existing infrastructure.
+
+  Key insight: The API doesn't need a new processor. It just:
+  1. Creates the semantic field mapping (triggers SemanticMappingTransformer)
+  2. The existing SemanticFieldProcessor reads from source_field automatically
+  3. The API is syntactic sugar over PutMapping + search pipeline management
+
+## API 2: Enable Semantic Search
+
+POST /_plugins/_neural/semantic/{index}/enable_semantic_search
+{
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "pipeline": "my-index-semantic-search-pipeline",
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+### What it does internally:
+1. Validates:
+   - semantic_field exists and has model_id resolved
+   - source_field matches the semantic_field's configured source
+   - No other semantic field already has search enabled for this source_field
+2. Creates/updates search pipeline with semantic_search_rewrite_processor
+3. Sets index.search.default_pipeline to the pipeline
+
+## API 3: Disable Semantic Search
+
+POST /_plugins/_neural/semantic/{index}/disable_semantic_search
+{
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+Response 200:
+{
+  "acknowledged": true,
+  "index": "my-index",
+  "pipeline_removed": true,
+  "fields": [
+    {"source_field": "title", "semantic_field": "title_semantic"},
+    {"source_field": "description", "semantic_field": "desc_semantic"}
+  ]
+}
+
+### What it does internally:
+1. Removes the field_map entry for this source_field from the search pipeline
+2. If no more entries remain, removes the pipeline and unsets default_pipeline
+3. If entries remain, update pipeline without this field
+
+## Validation Rules
+
+| Check                                              | Error                                          |
+|----------------------------------------------------|------------------------------------------------|
+| source_field doesn't exist                         | "source_field [X] does not exist in index [Y]" |
+| source_field type not compatible                   | "source_field type [Z] not compatible..."      |
+| Another semantic field already enriches same source | "source_field [X] already enriched by [W]"    |
+| enable_search when field is DISABLED               | "semantic_field [X] is DISABLED"               |
+| enable_search when another field already enabled   | "search already enabled for [X] via [W]"       |
+| semantic_field already exists (not created by API) | "semantic_field [X] already exists"            |
+
+## Customer Workflow
+
+1. Customer has existing index "products" with field "description" (type: text)
+
+2. Enable enrichment (can enable multiple fields at once):
+   POST /_plugins/_neural/semantic/products/enable_semantic_enrichment
+   {"fields": [
+     {"source_field": "title", "semantic_field": "title_semantic"},
+     {"source_field": "description", "semantic_field": "desc_semantic"}
+   ]}
+   → Semantic fields created, new docs get embeddings automatically
+
+3. Customer ingests new docs — they get embeddings for both fields
+
+4. Backfill existing docs (optional):
+   POST /products/_update_by_query
+   {"query": {"match_all": {}}}
+   → Old docs re-processed through ingest, get embeddings
+
+5. Test quality with explicit neural queries:
+   GET /products/_search
+   {"query": {"neural_sparse": {"title_semantic_semantic_info.embedding": {"query_text": "..."}}}}
+
+6. When satisfied — enable search rewrite (can enable for multiple fields):
+   POST /_plugins/_neural/semantic/products/enable_semantic_search
+   {"fields": [
+     {"source_field": "title", "semantic_field": "title_semantic"},
+     {"source_field": "description", "semantic_field": "desc_semantic"}
+   ]}
+   → Now all match queries on "title" and "description" auto-rewrite to neural
+
+7. If quality is bad — rollback:
+   POST /_plugins/_neural/semantic/products/disable_semantic_search
+   {"fields": [
+     {"source_field": "title", "semantic_field": "title_semantic"},
+     {"source_field": "description", "semantic_field": "desc_semantic"}
+   ]}
+   → Back to BM25 match
+   → Embeddings still being generated for new docs (enrichment not stopped)
+
+## Comparison with Current source_field Approach
+
+| Aspect                    | source_field on semantic type | Explicit API                    |
+|---------------------------|-------------------------------|---------------------------------|
+| Setup complexity          | Single PutMapping call        | Separate API call               |
+| Search toggle             | status ENABLED/DISABLED       | enable_search/disable_search    |
+| Granularity               | Coupled (enrich + search)     | Decoupled                       |
+| Discoverability           | Hidden in mapping params      | Explicit API endpoint           |
+| Backward compat           | New param on existing type    | New REST endpoints              |
+| AOS/AOSS integration      | Needs mapping support         | Can be separate plugin          |
+| Core change needed?       | No (all in neural-search)     | No (all in neural-search)       |
+| Rollback safety           | DISABLED stops embeddings too | disable_search keeps embeddings |
+
+## Key Differences from source_field approach
+
+1. DECOUPLED: Enrichment (embeddings) is separate from search rewrite toggle.
+   With source_field, status DISABLED stops BOTH embeddings AND search.
+   With API approach, you can keep generating embeddings while search is off.
+
+2. EXPLICIT: Customer deliberately enables search rather than it being automatic.
+   Safer for production — they can validate quality before switching traffic.
+
+3. GRADUAL ROLLOUT: Customer can:
+   - Enable enrichment → test with explicit neural queries → enable search rewrite
+   - vs. source_field: create index → search rewrite is immediately active
+
+4. STILL USES source_field INTERNALLY: The API calls PutMapping with the semantic
+   field + source_field parameter under the hood. So the internal mechanism is the
+   same — the API just provides a better UX layer.
+
+## Open Questions
+
+1. Should "enable" also support specifying model_id directly (for OSS users)?
+   → Yes, as optional override. If provided, skip resolver.
+
+2. Should there be a GET /_plugins/_neural/semantic/{index}/status to show state?
+   → Nice to have. Shows which fields are enriched, which have search enabled.
+
+3. Should "enable" auto-run _update_by_query on existing docs?
+   → No — expensive, customer should control timing. Document this.
+
+4. For AOSS: _update_by_query not supported. How do old docs get embeddings?
+   → They don't unless re-ingested. Document this limitation.
+   → On AOSS with rollover, new index segments get embeddings on next write.
+
+5. Should there be a "disable" (stop enrichment entirely)?
+   → Could be POST /_plugins/_neural/semantic/{index}/disable
+   → Sets status=DISABLED on the semantic field, stops embedding generation.
+   → Or just let customer use PutMapping directly for that.
