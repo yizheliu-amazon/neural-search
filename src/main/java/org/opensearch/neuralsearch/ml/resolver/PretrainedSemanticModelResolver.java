@@ -88,38 +88,43 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
         SearchSourceBuilder sourceBuilder = new SearchSourceBuilder().query(query).size(10);
         SearchRequest searchRequest = new SearchRequest(ML_MODEL_INDEX).source(sourceBuilder);
 
-        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
-            SearchHit[] hits = searchResponse.getHits().getHits();
-            if (hits.length == 0) {
-                listener.onResponse(null);
-                return;
-            }
-            // The ML model index stores both metadata docs and content chunks under the same name.
-            // Extract the model_id from the source (all docs carry it) and deduplicate, then
-            // verify DEPLOYED state via the GET model API.
-            String candidateModelId = null;
-            for (SearchHit hit : hits) {
-                Map<String, Object> source = hit.getSourceAsMap();
-                Object mid = source != null ? source.get("model_id") : null;
-                if (mid != null && !mid.toString().isEmpty()) {
-                    candidateModelId = mid.toString();
-                    break;
-                }
-            }
-            if (candidateModelId == null) {
-                listener.onResponse(null);
-                return;
-            }
-            // Verify this model is DEPLOYED via the GET model API
-            String finalModelId = candidateModelId;
-            mlClient.getModel(finalModelId, null, ActionListener.wrap(model -> {
-                if (model.getModelState() != null && "DEPLOYED".equals(model.getModelState().name())) {
-                    listener.onResponse(finalModelId);
-                } else {
+        // Stash the user's security context so this system-level search executes with plugin
+        // privileges, not the calling user's credentials. Without this, users without read access
+        // to .plugins-ml-model would fail the search (the fallback still works, but model reuse wouldn't).
+        try (var ignored = client.threadPool().getThreadContext().stashContext()) {
+            client.search(searchRequest, ActionListener.wrap(searchResponse -> {
+                SearchHit[] hits = searchResponse.getHits().getHits();
+                if (hits.length == 0) {
                     listener.onResponse(null);
+                    return;
                 }
-            }, e -> listener.onResponse(null)));
-        }, listener::onFailure));
+                // The ML model index stores both metadata docs and content chunks under the same name.
+                // Extract the model_id from the source (all docs carry it) and deduplicate, then
+                // verify DEPLOYED state via the GET model API.
+                String candidateModelId = null;
+                for (SearchHit hit : hits) {
+                    Map<String, Object> source = hit.getSourceAsMap();
+                    Object mid = source != null ? source.get("model_id") : null;
+                    if (mid != null && !mid.toString().isEmpty()) {
+                        candidateModelId = mid.toString();
+                        break;
+                    }
+                }
+                if (candidateModelId == null) {
+                    listener.onResponse(null);
+                    return;
+                }
+                // Verify this model is DEPLOYED via the GET model API
+                String finalModelId = candidateModelId;
+                mlClient.getModel(finalModelId, null, ActionListener.wrap(model -> {
+                    if (model.getModelState() != null && "DEPLOYED".equals(model.getModelState().name())) {
+                        listener.onResponse(finalModelId);
+                    } else {
+                        listener.onResponse(null);
+                    }
+                }, e -> listener.onResponse(null)));
+            }, listener::onFailure));
+        }
     }
 
     private String resolveFunctionName(String modelName) {
