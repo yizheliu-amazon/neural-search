@@ -57,11 +57,18 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
         validate(language, modelType);
 
         String cacheKey = normKey(language, modelType);
+        String cached = resolvedModelCache.get(cacheKey);
+        if (cached != null) {
+            log.debug("Using cached model_id [{}] for [{}/{}]", cached, language, modelType);
+            listener.onResponse(cached);
+            return;
+        }
+
         String modelName = resolveModelName(language, modelType);
         String modelVersion = resolveModelVersion(language, modelType);
 
-        // Always search ml-commons first (skip in-memory cache for testability).
-        // This makes it easy to verify the search path works end-to-end.
+        // Search ml-commons for an already-deployed model before registering a new one.
+        // This avoids duplicate deployments across node restarts or multiple CreateIndex calls.
         searchExistingModel(modelName, modelVersion, cacheKey, ActionListener.wrap(existingModelId -> {
             if (existingModelId != null) {
                 log.info("Found existing DEPLOYED model [{}] for [{}/{}], reusing", existingModelId, language, modelType);
