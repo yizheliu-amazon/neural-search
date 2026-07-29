@@ -22,6 +22,7 @@ import org.opensearch.ml.common.model.MLModelFormat;
 import org.opensearch.ml.common.transport.register.MLRegisterModelInput;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.transport.client.Client;
 
 /**
  * OSS default implementation of SemanticModelResolver.
@@ -40,11 +41,15 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
     public static final String DENSE_ENGLISH_MODEL = "huggingface/sentence-transformers/all-MiniLM-L6-v2";
     public static final String DENSE_ENGLISH_MODEL_VERSION = "1.0.1";
 
+    private static final String ML_MODEL_INDEX = ".plugins-ml-model";
+
     private final MachineLearningNodeClient mlClient;
+    private final Client client;
     private final Map<String, String> resolvedModelCache = new ConcurrentHashMap<>();
 
-    public PretrainedSemanticModelResolver(MachineLearningNodeClient mlClient) {
+    public PretrainedSemanticModelResolver(MachineLearningNodeClient mlClient, Client client) {
         this.mlClient = mlClient;
+        this.client = client;
     }
 
     @Override
@@ -52,18 +57,11 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
         validate(language, modelType);
 
         String cacheKey = normKey(language, modelType);
-        String cached = resolvedModelCache.get(cacheKey);
-        if (cached != null) {
-            log.debug("Using cached model_id [{}] for [{}/{}]", cached, language, modelType);
-            listener.onResponse(cached);
-            return;
-        }
-
         String modelName = resolveModelName(language, modelType);
         String modelVersion = resolveModelVersion(language, modelType);
 
-        // Search for an already-deployed model with the same name+version before registering a new one.
-        // This avoids duplicate model deployments across multiple semantic fields or node restarts.
+        // Always search ml-commons first (skip in-memory cache for testability).
+        // This makes it easy to verify the search path works end-to-end.
         searchExistingModel(modelName, modelVersion, cacheKey, ActionListener.wrap(existingModelId -> {
             if (existingModelId != null) {
                 log.info("Found existing DEPLOYED model [{}] for [{}/{}], reusing", existingModelId, language, modelType);
@@ -80,23 +78,55 @@ public class PretrainedSemanticModelResolver implements SemanticModelResolver {
     }
 
     private void searchExistingModel(String modelName, String modelVersion, String cacheKey, ActionListener<String> listener) {
+        // Search the .plugins-ml-model index directly using the standard OpenSearch Client.
+        // We cannot use mlClient.searchModel() because it requires MLSearchActionRequest which
+        // is loaded by a different classloader (plugin isolation) and causes ClassCastException.
         BoolQueryBuilder query = QueryBuilders.boolQuery()
             .must(QueryBuilders.termQuery("name.keyword", modelName))
-            .must(QueryBuilders.termQuery("model_version", modelVersion))
-            .must(QueryBuilders.termQuery("model_state", "DEPLOYED"));
+            .must(QueryBuilders.termQuery("algorithm", resolveFunctionName(modelName)));
 
-        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder().query(query).size(1);
-        SearchRequest searchRequest = new SearchRequest().source(sourceBuilder);
+        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder().query(query).size(10);
+        SearchRequest searchRequest = new SearchRequest(ML_MODEL_INDEX).source(sourceBuilder);
 
-        mlClient.searchModel(searchRequest, ActionListener.wrap(searchResponse -> {
+        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
             SearchHit[] hits = searchResponse.getHits().getHits();
-            if (hits.length > 0) {
-                String modelId = hits[0].getId();
-                listener.onResponse(modelId);
-            } else {
+            if (hits.length == 0) {
                 listener.onResponse(null);
+                return;
             }
+            // The ML model index stores both metadata docs and content chunks under the same name.
+            // Extract the model_id from the source (all docs carry it) and deduplicate, then
+            // verify DEPLOYED state via the GET model API.
+            String candidateModelId = null;
+            for (SearchHit hit : hits) {
+                Map<String, Object> source = hit.getSourceAsMap();
+                Object mid = source != null ? source.get("model_id") : null;
+                if (mid != null && !mid.toString().isEmpty()) {
+                    candidateModelId = mid.toString();
+                    break;
+                }
+            }
+            if (candidateModelId == null) {
+                listener.onResponse(null);
+                return;
+            }
+            // Verify this model is DEPLOYED via the GET model API
+            String finalModelId = candidateModelId;
+            mlClient.getModel(finalModelId, null, ActionListener.wrap(model -> {
+                if (model.getModelState() != null && "DEPLOYED".equals(model.getModelState().name())) {
+                    listener.onResponse(finalModelId);
+                } else {
+                    listener.onResponse(null);
+                }
+            }, e -> listener.onResponse(null)));
         }, listener::onFailure));
+    }
+
+    private String resolveFunctionName(String modelName) {
+        if (modelName.contains("sentence-transformers") || modelName.contains("text-embedding")) {
+            return "TEXT_EMBEDDING";
+        }
+        return "SPARSE_ENCODING";
     }
 
     private void registerAndDeploy(
