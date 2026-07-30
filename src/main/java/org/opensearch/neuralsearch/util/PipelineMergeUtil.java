@@ -270,9 +270,10 @@ public class PipelineMergeUtil {
 
                 if (REMOVE_PROCESSOR.equals(processorType)) {
                     checkRemoveConflict(config, sourceFields, conflicts);
-                } else if (RENAME_PROCESSOR.equals(processorType)) {} else if (TEXT_CHUNKING_PROCESSOR.equals(processorType)) {
-                    checkTextChunkingConflict(config, sourceFields, conflicts);
+                } else if (RENAME_PROCESSOR.equals(processorType)) {
                     checkRenameConflict(config, sourceFields, conflicts);
+                } else if (TEXT_CHUNKING_PROCESSOR.equals(processorType)) {
+                    checkTextChunkingConflict(config, sourceFields, conflicts);
                 } else if (PIPELINE_PROCESSOR.equals(processorType)) {
                     // Recursively check sub-pipeline
                     String subPipelineName = (String) config.get(NAME_KEY);
