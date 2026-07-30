@@ -93,19 +93,24 @@ public class PipelineMergeUtil {
     // =========================================================================
 
     /**
-     * Merge ASE search processors into an existing customer search pipeline.
-     * ASE processors are prepended (run first).
+     * Pre-check whether an existing search pipeline blocks ASE merge, WITHOUT requiring
+     * the ASE processor content (e.g., model_id) to be known yet.
+     *
+     * <p>Use this before any irreversible mutation (such as PutMapping, which cannot be
+     * undone) so that a blocking conflict is detected before the mutation happens. Once
+     * this check passes and the mutation has been applied, callers should build and PUT
+     * the merged pipeline directly via {@link #buildMergedSearchPipeline} WITHOUT
+     * re-running this check — the mutation has already committed, and a second rejection
+     * at that point would leave the index in a half-configured state with no way back.
      *
      * @param existingPipeline The existing search pipeline definition as a Map.
-     * @param aseRequestProcessors The ASE request processors to prepend.
-     * @return MergeResult with the merged pipeline.
+     * @return List of conflict messages. Empty list means no blocking conflict.
      */
-    public static MergeResult mergeSearchPipeline(Map<String, Object> existingPipeline, List<Map<String, Object>> aseRequestProcessors) {
-
+    public static List<String> checkSearchPipelineConflicts(Map<String, Object> existingPipeline) {
         List<String> conflicts = new ArrayList<>();
+        List<Map<String, Object>> existingRequestProcessors = getProcessorsList(existingPipeline, REQUEST_PROCESSORS_KEY);
 
         // Check for existing ASE processors (idempotency guard)
-        List<Map<String, Object>> existingRequestProcessors = getProcessorsList(existingPipeline, REQUEST_PROCESSORS_KEY);
         for (Map<String, Object> proc : existingRequestProcessors) {
             for (Map.Entry<String, Object> entry : proc.entrySet()) {
                 if (!(entry.getValue() instanceof Map)) continue;
@@ -148,38 +153,81 @@ public class PipelineMergeUtil {
             }
         }
 
-        if (!conflicts.isEmpty()) {
-            return MergeResult.blocked(conflicts);
-        }
+        return conflicts;
+    }
 
-        // Build merged pipeline: ASE first, then customer processors
+    /**
+     * Build the merged search pipeline content, WITHOUT re-running conflict checks.
+     *
+     * <p>Callers MUST have already called {@link #checkSearchPipelineConflicts} on the
+     * same {@code existingPipeline} (before any irreversible mutation) and confirmed it
+     * returned no conflicts. This method performs no validation of its own — by the time
+     * it runs, rejecting is no longer a safe option, since the caller's mutation (e.g.
+     * PutMapping) has typically already committed.
+     *
+     * @param existingPipeline The existing search pipeline definition as a Map.
+     * @param aseRequestProcessors The ASE request processors to prepend (with resolved model_id, etc.).
+     * @return The merged pipeline content, ready to PUT.
+     */
+    public static Map<String, Object> buildMergedSearchPipeline(
+        Map<String, Object> existingPipeline,
+        List<Map<String, Object>> aseRequestProcessors
+    ) {
+        List<Map<String, Object>> existingRequestProcessors = getProcessorsList(existingPipeline, REQUEST_PROCESSORS_KEY);
         Map<String, Object> merged = new LinkedHashMap<>(existingPipeline);
         List<Map<String, Object>> mergedProcessors = new ArrayList<>(aseRequestProcessors);
         mergedProcessors.addAll(existingRequestProcessors);
         merged.put(REQUEST_PROCESSORS_KEY, mergedProcessors);
+        return merged;
+    }
 
-        return MergeResult.success(merged);
+    /**
+     * Convenience method that runs {@link #checkSearchPipelineConflicts} and
+     * {@link #buildMergedSearchPipeline} together in one call.
+     *
+     * <p>Only use this when the ASE processor content is fully known up front and no
+     * irreversible mutation happens between the check and the build (i.e., there is no
+     * PutMapping-style step in between). If there IS such a step, call
+     * {@link #checkSearchPipelineConflicts} before it and {@link #buildMergedSearchPipeline}
+     * after it instead — do not call this combined method in that case.
+     *
+     * @param existingPipeline The existing search pipeline definition as a Map.
+     * @param aseRequestProcessors The ASE request processors to prepend.
+     * @return MergeResult with the merged pipeline, or blocked with conflict messages.
+     */
+    public static MergeResult mergeSearchPipeline(Map<String, Object> existingPipeline, List<Map<String, Object>> aseRequestProcessors) {
+        List<String> conflicts = checkSearchPipelineConflicts(existingPipeline);
+        if (!conflicts.isEmpty()) {
+            return MergeResult.blocked(conflicts);
+        }
+        return MergeResult.success(buildMergedSearchPipeline(existingPipeline, aseRequestProcessors));
     }
 
     // =========================================================================
     // INGEST PIPELINE MERGE
+    //
+    // NOTE: The `semantic` field type used in this branch generates embeddings via
+    // SemanticFieldProcessor, a system-generated ingest processor -- there is no
+    // customer-visible ingest pipeline to merge into for that feature, so these methods
+    // are intentionally NOT called from RestSemanticEnableHandler or
+    // SemanticSearchPipelineActionFilter (confirmed with Yizhe). They remain here as a
+    // reusable utility, since the same ingest pipeline merge/conflict logic is expected
+    // to be useful for the other (non-`semantic`-field) ASE pipeline-merge implementation.
     // =========================================================================
 
     /**
-     * Evaluate and merge ASE's ingest processor into an existing customer ingest pipeline.
-     * ASE processor is appended (runs last). Checks for conflicts first.
+     * Pre-check whether an existing ingest pipeline blocks ASE merge, WITHOUT requiring
+     * the ASE processor content (e.g., model_id) to be known yet.
+     *
+     * <p>Same rationale as {@link #checkSearchPipelineConflicts}: call this before any
+     * irreversible mutation, and use {@link #buildMergedIngestPipeline} afterward WITHOUT
+     * re-checking.
      *
      * @param existingPipeline The existing ingest pipeline definition as a Map.
      * @param sourceFields The text fields ASE will read from.
-     * @param aseIngestProcessor The ASE ingest processor to append (e.g., sparse_encoding).
-     * @return MergeResult with merged pipeline or blocked with conflict messages.
+     * @return List of conflict messages. Empty list means no blocking conflict.
      */
-    public static MergeResult mergeIngestPipeline(
-        Map<String, Object> existingPipeline,
-        Set<String> sourceFields,
-        Map<String, Object> aseIngestProcessor
-    ) {
-
+    public static List<String> checkIngestPipelineConflicts(Map<String, Object> existingPipeline, Set<String> sourceFields) {
         List<Map<String, Object>> processors = getProcessorsList(existingPipeline, PROCESSORS_KEY);
         List<String> conflicts = new ArrayList<>();
 
@@ -211,17 +259,54 @@ public class PipelineMergeUtil {
         // Check for remove/rename conflicts on source fields
         conflicts.addAll(scanIngestConflicts(processors, sourceFields));
 
-        if (!conflicts.isEmpty()) {
-            return MergeResult.blocked(conflicts);
-        }
+        return conflicts;
+    }
 
-        // Build merged pipeline: customer processors + ASE appended last
+    /**
+     * Build the merged ingest pipeline content, WITHOUT re-running conflict checks.
+     *
+     * <p>Callers MUST have already called {@link #checkIngestPipelineConflicts} on the
+     * same {@code existingPipeline} before any irreversible mutation and confirmed it
+     * returned no conflicts. See {@link #buildMergedSearchPipeline} javadoc for the
+     * same rationale.
+     *
+     * @param existingPipeline The existing ingest pipeline definition as a Map.
+     * @param aseIngestProcessor The ASE ingest processor to append (e.g., sparse_encoding).
+     * @return The merged pipeline content, ready to PUT.
+     */
+    public static Map<String, Object> buildMergedIngestPipeline(
+        Map<String, Object> existingPipeline,
+        Map<String, Object> aseIngestProcessor
+    ) {
+        List<Map<String, Object>> processors = getProcessorsList(existingPipeline, PROCESSORS_KEY);
         Map<String, Object> merged = new LinkedHashMap<>(existingPipeline);
         List<Map<String, Object>> mergedProcessors = new ArrayList<>(processors);
         mergedProcessors.add(aseIngestProcessor);
         merged.put(PROCESSORS_KEY, mergedProcessors);
+        return merged;
+    }
 
-        return MergeResult.success(merged);
+    /**
+     * Convenience method that runs {@link #checkIngestPipelineConflicts} and
+     * {@link #buildMergedIngestPipeline} together in one call. Only use when there is no
+     * irreversible mutation between the check and the build — see
+     * {@link #mergeSearchPipeline} javadoc for the same caveat.
+     *
+     * @param existingPipeline The existing ingest pipeline definition as a Map.
+     * @param sourceFields The text fields ASE will read from.
+     * @param aseIngestProcessor The ASE ingest processor to append (e.g., sparse_encoding).
+     * @return MergeResult with merged pipeline or blocked with conflict messages.
+     */
+    public static MergeResult mergeIngestPipeline(
+        Map<String, Object> existingPipeline,
+        Set<String> sourceFields,
+        Map<String, Object> aseIngestProcessor
+    ) {
+        List<String> conflicts = checkIngestPipelineConflicts(existingPipeline, sourceFields);
+        if (!conflicts.isEmpty()) {
+            return MergeResult.blocked(conflicts);
+        }
+        return MergeResult.success(buildMergedIngestPipeline(existingPipeline, aseIngestProcessor));
     }
 
     // =========================================================================

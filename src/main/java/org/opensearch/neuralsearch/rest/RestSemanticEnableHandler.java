@@ -18,10 +18,10 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.neuralsearch.plugin.NeuralSearch;
+import org.opensearch.neuralsearch.util.PipelineMergeUtil;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
@@ -36,7 +36,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.StringJoiner;
 
 /**
  * REST handler for semantic field enable/disable APIs.
@@ -148,17 +147,6 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             return;
         }
 
-        // Check for non-ASE pipeline conflict
-        String currentPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
-        if (currentPipeline != null && !currentPipeline.endsWith(SEARCH_PIPELINE_SUFFIX)) {
-            sendError(
-                channel,
-                RestStatus.BAD_REQUEST,
-                "Index [" + index + "] already has a non-ASE search pipeline [" + currentPipeline + "]"
-            );
-            return;
-        }
-
         // Validate all fields first
         StringBuilder mappingBuilder = new StringBuilder("{\"properties\":{");
         boolean first = true;
@@ -263,25 +251,90 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             validatedFields.add(new String[] { originalField, semanticField, language, modelType });
         }
         mappingBuilder.append("}}");
+        final String mappingSource = mappingBuilder.toString();
 
-        // Execute PutMapping for all fields at once
+        // Pre-check pipeline mergeability BEFORE PutMapping, since PutMapping is irreversible
+        // (OpenSearch does not support removing a field from a mapping once added). If the
+        // existing search pipeline has a blocking conflict, we must fail now — before any
+        // mutation — rather than discover it after the mapping has already changed.
+        //
+        // NOTE: this pre-check does not need model_id (which the mapper resolves during
+        // PutMapping), so it only calls checkSearchPipelineConflicts, not the full merge.
+        // Once PutMapping succeeds below, we build and PUT the merged pipeline directly via
+        // buildMergedSearchPipeline WITHOUT re-checking — see PipelineMergeUtil javadoc for why.
+        //
+        // NOTE: there is no equivalent ingest-pipeline pre-check here. The `semantic` field
+        // type generates embeddings via SemanticFieldProcessor, a system-generated ingest
+        // processor -- there is no customer-visible ingest pipeline for this feature to
+        // merge into (confirmed with Yizhe). PipelineMergeUtil.checkIngestPipelineConflicts /
+        // buildMergedIngestPipeline remain available as a utility for other ASE
+        // implementations that DO use a customer-visible ingest pipeline.
+        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
+        String existingDefaultPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
+        String pipelineToCheck = (existingDefaultPipeline != null && !existingDefaultPipeline.endsWith(SEARCH_PIPELINE_SUFFIX))
+            ? existingDefaultPipeline
+            : pipelineName;
+
+        GetSearchPipelineRequest preCheckRequest = new GetSearchPipelineRequest(pipelineToCheck);
+        client.admin()
+            .cluster()
+            .execute(GetSearchPipelineAction.INSTANCE, preCheckRequest, new ActionListener<GetSearchPipelineResponse>() {
+                @Override
+                public void onResponse(GetSearchPipelineResponse getResponse) {
+                    if (getResponse.pipelines() != null && !getResponse.pipelines().isEmpty()) {
+                        Map<String, Object> existingConfig = getResponse.pipelines().get(0).getConfigAsMap();
+                        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(existingConfig);
+                        if (!conflicts.isEmpty()) {
+                            sendError(
+                                channel,
+                                RestStatus.CONFLICT,
+                                "Cannot enable ASE: existing search pipeline ["
+                                    + pipelineToCheck
+                                    + "] has a blocking conflict: "
+                                    + String.join("; ", conflicts)
+                            );
+                            return;
+                        }
+                    }
+                    proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    // GET failing typically means the pipeline doesn't exist yet — nothing to conflict with.
+                    proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+                }
+            });
+    }
+
+    private void proceedWithPutMapping(
+        String index,
+        String mappingSource,
+        List<String[]> validatedFields,
+        NodeClient client,
+        RestChannel channel
+    ) {
         PutMappingRequest putMappingRequest = new PutMappingRequest(index);
-        putMappingRequest.source(mappingBuilder.toString(), XContentType.JSON);
+        putMappingRequest.source(mappingSource, XContentType.JSON);
 
         client.admin().indices().putMapping(putMappingRequest, new ActionListener<AcknowledgedResponse>() {
             @Override
             public void onResponse(AcknowledgedResponse response) {
                 if (!response.isAcknowledged()) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping was not acknowledged");
+                    sendError(channel, RestStatus.BAD_REQUEST, "PutMapping was not acknowledged");
                     return;
                 }
-                // After mapping is created, create the search pipeline with semantic_search_rewrite_processor
+                // Mapping mutation has committed. From here on we only construct and PUT the
+                // merged pipeline — no more rejecting, since rejecting now would leave the
+                // index in a half-configured state with no way to undo the mapping change.
                 createSearchPipelineForEnrichment(index, validatedFields, client, channel);
             }
 
             @Override
             public void onFailure(Exception e) {
-                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create semantic fields: " + e.getMessage());
+                // PutMapping itself failed (e.g. model resolution error) — this is a client-correctable
+                // condition, not a server fault, so surface as 4xx rather than 500.
+                sendError(channel, RestStatus.BAD_REQUEST, "Failed to create semantic fields: " + e.getMessage());
             }
         });
     }
@@ -295,8 +348,71 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             updatedProps = (Map<String, Object>) updated.mapping().sourceAsMap().get("properties");
         }
 
-        // Build field_map with SEMANTIC field name as key (not source field)
-        StringJoiner rewriteFieldMapEntries = new StringJoiner(",");
+        // Build the list of ASE request processors to install (rewrite + two-phase),
+        // each tagged as ASE-managed so PipelineMergeUtil can detect them later.
+        List<Map<String, Object>> aseProcessors = buildAseSearchProcessors(validatedFields, updatedProps);
+
+        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
+        final Map<String, Object> finalUpdatedProps = updatedProps;
+
+        // GET any existing pipeline at this name (or the index's current default_pipeline,
+        // if it's a customer-owned pipeline under a different name) so we can merge instead
+        // of unconditionally overwriting.
+        String currentDefaultPipeline = indexMetadata(index).getSettings().get("index.search.default_pipeline");
+        String pipelineToRead = (currentDefaultPipeline != null && !currentDefaultPipeline.endsWith(SEARCH_PIPELINE_SUFFIX))
+            ? currentDefaultPipeline
+            : pipelineName;
+
+        GetSearchPipelineRequest getRequest = new GetSearchPipelineRequest(pipelineToRead);
+        client.admin().cluster().execute(GetSearchPipelineAction.INSTANCE, getRequest, new ActionListener<GetSearchPipelineResponse>() {
+            @Override
+            public void onResponse(GetSearchPipelineResponse getResponse) {
+                // NOTE: no conflict check here. handleEnableEnrichment already called
+                // PipelineMergeUtil.checkSearchPipelineConflicts BEFORE PutMapping ran (which
+                // is now irreversible). Re-checking here and rejecting would be too late —
+                // the mapping has already committed — so we only construct and PUT.
+                Map<String, Object> mergedConfig;
+                if (getResponse.pipelines() == null || getResponse.pipelines().isEmpty()) {
+                    // No existing pipeline — create fresh with just ASE processors.
+                    Map<String, Object> fresh = new LinkedHashMap<>();
+                    fresh.put("request_processors", aseProcessors);
+                    mergedConfig = fresh;
+                } else {
+                    Map<String, Object> existingConfig = getResponse.pipelines().get(0).getConfigAsMap();
+                    mergedConfig = PipelineMergeUtil.buildMergedSearchPipeline(existingConfig, aseProcessors);
+                }
+                putSearchPipelineConfig(
+                    pipelineName,
+                    mergedConfig,
+                    client,
+                    channel,
+                    () -> setDefaultSearchPipelineAndRespond(index, pipelineName, validatedFields, finalUpdatedProps, client, channel)
+                );
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                // GET failing typically means the pipeline doesn't exist — treat as fresh create.
+                Map<String, Object> fresh = new LinkedHashMap<>();
+                fresh.put("request_processors", aseProcessors);
+                putSearchPipelineConfig(
+                    pipelineName,
+                    fresh,
+                    client,
+                    channel,
+                    () -> setDefaultSearchPipelineAndRespond(index, pipelineName, validatedFields, finalUpdatedProps, client, channel)
+                );
+            }
+        });
+    }
+
+    /**
+     * Build the ASE search request processors (semantic_search_rewrite_processor +
+     * neural_sparse_two_phase_processor), tagged ase_managed, from the validated fields.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> buildAseSearchProcessors(List<String[]> validatedFields, Map<String, Object> updatedProps) {
+        Map<String, Object> fieldMap = new LinkedHashMap<>();
         for (String[] vf : validatedFields) {
             String semanticField = vf[1];
             String modelId = "unknown";
@@ -307,95 +423,126 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             }
             String targetField = semanticField + "_semantic_info.embedding";
             String type = "SPARSE".equalsIgnoreCase(modelType) ? "sparse" : "dense";
-            String analyzer = "SPARSE".equalsIgnoreCase(modelType) ? ",\"analyzer\":\"bert-uncased\"" : "";
-            rewriteFieldMapEntries.add(
-                String.format(
-                    Locale.ROOT,
-                    "\"%s\":{\"type\":\"%s\",\"target_field\":\"%s\",\"model_id\":\"%s\"%s}",
-                    semanticField,
-                    type,
-                    targetField,
-                    modelId,
-                    analyzer
-                )
-            );
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("type", type);
+            entry.put("target_field", targetField);
+            entry.put("model_id", modelId);
+            if ("SPARSE".equalsIgnoreCase(modelType)) {
+                entry.put("analyzer", "bert-uncased");
+            }
+            fieldMap.put(semanticField, entry);
         }
 
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        String pipelineBody = String.format(
-            Locale.ROOT,
-            "{\"request_processors\":[{\"semantic_search_rewrite_processor\":{\"field_map\":{%s}}}"
-                + ",{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
-            rewriteFieldMapEntries.toString()
-        );
+        Map<String, Object> rewriteConfig = new LinkedHashMap<>();
+        rewriteConfig.put(PipelineMergeUtil.TAG_KEY, PipelineMergeUtil.ASE_MANAGED_TAG);
+        rewriteConfig.put("field_map", fieldMap);
+        Map<String, Object> rewriteProcessor = new LinkedHashMap<>();
+        rewriteProcessor.put(PipelineMergeUtil.SEMANTIC_SEARCH_REWRITE_PROCESSOR, rewriteConfig);
 
-        PutSearchPipelineRequest pipelineRequest = new PutSearchPipelineRequest(
-            pipelineName,
-            new BytesArray(pipelineBody),
-            XContentType.JSON
-        );
+        Map<String, Object> twoPhaseConfig = new LinkedHashMap<>();
+        twoPhaseConfig.put(PipelineMergeUtil.TAG_KEY, PipelineMergeUtil.ASE_MANAGED_TAG);
+        twoPhaseConfig.put("enabled", true);
+        Map<String, Object> twoPhaseProcessor = new LinkedHashMap<>();
+        twoPhaseProcessor.put(PipelineMergeUtil.NEURAL_SPARSE_TWO_PHASE_PROCESSOR, twoPhaseConfig);
 
-        final Map<String, Object> finalUpdatedProps = updatedProps;
-        client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, pipelineRequest, new ActionListener<AcknowledgedResponse>() {
-            @Override
-            public void onResponse(AcknowledgedResponse response) {
-                if (!response.isAcknowledged()) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create search pipeline");
-                    return;
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(rewriteProcessor);
+        processors.add(twoPhaseProcessor);
+        return processors;
+    }
+
+    private IndexMetadata indexMetadata(String index) {
+        return clusterService.state().metadata().index(index);
+    }
+
+    /**
+     * PUT a search pipeline given a config map (used for both fresh-create and merged cases).
+     */
+    private void putSearchPipelineConfig(
+        String pipelineName,
+        Map<String, Object> configMap,
+        NodeClient client,
+        RestChannel channel,
+        Runnable onSuccess
+    ) {
+        try {
+            org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.core.xcontent.XContentBuilder.builder(
+                XContentType.JSON.xContent()
+            );
+            builder.map(configMap);
+            org.opensearch.core.common.bytes.BytesReference pipelineBytes = org.opensearch.core.common.bytes.BytesReference.bytes(builder);
+
+            PutSearchPipelineRequest putRequest = new PutSearchPipelineRequest(pipelineName, pipelineBytes, XContentType.JSON);
+            client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, putRequest, new ActionListener<AcknowledgedResponse>() {
+                @Override
+                public void onResponse(AcknowledgedResponse response) {
+                    if (!response.isAcknowledged()) {
+                        sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create/merge search pipeline");
+                        return;
+                    }
+                    onSuccess.run();
                 }
-                // Set as default search pipeline
-                org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest settingsRequest =
-                    new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
-                settingsRequest.settings(
-                    org.opensearch.common.settings.Settings.builder().put("index.search.default_pipeline", pipelineName).build()
-                );
-                client.admin().indices().updateSettings(settingsRequest, new ActionListener<AcknowledgedResponse>() {
-                    @Override
-                    public void onResponse(AcknowledgedResponse settingsResp) {
-                        StringBuilder respBuilder = new StringBuilder(
-                            "{\"acknowledged\":true,\"index\":\"" + index + "\",\"pipeline\":\"" + pipelineName + "\",\"fields\":["
-                        );
-                        boolean respFirst = true;
-                        for (String[] vf : validatedFields) {
-                            if (!respFirst) respBuilder.append(",");
-                            String modelId = "unknown";
-                            if (finalUpdatedProps != null && finalUpdatedProps.get(vf[1]) instanceof Map) {
-                                Object mid = ((Map<String, Object>) finalUpdatedProps.get(vf[1])).get("model_id");
-                                if (mid != null) modelId = mid.toString();
-                            }
-                            respBuilder.append(
-                                String.format(
-                                    Locale.ROOT,
-                                    "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"model_id\":\"%s\",\"status\":\"ENABLED\"}",
-                                    vf[0],
-                                    vf[1],
-                                    modelId
-                                )
-                            );
-                            respFirst = false;
-                        }
-                        respBuilder.append("]}");
-                        try {
-                            channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-                        } catch (Exception e) {
-                            log.error("Failed to send response", e);
-                        }
-                    }
 
-                    @Override
-                    public void onFailure(Exception e) {
-                        sendError(
-                            channel,
-                            RestStatus.INTERNAL_SERVER_ERROR,
-                            "Pipeline created but failed to set as default: " + e.getMessage()
-                        );
+                @Override
+                public void onFailure(Exception e) {
+                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create/merge search pipeline: " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to serialize pipeline config: " + e.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void setDefaultSearchPipelineAndRespond(
+        String index,
+        String pipelineName,
+        List<String[]> validatedFields,
+        Map<String, Object> finalUpdatedProps,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest settingsRequest =
+            new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
+        settingsRequest.settings(
+            org.opensearch.common.settings.Settings.builder().put("index.search.default_pipeline", pipelineName).build()
+        );
+        client.admin().indices().updateSettings(settingsRequest, new ActionListener<AcknowledgedResponse>() {
+            @Override
+            public void onResponse(AcknowledgedResponse settingsResp) {
+                StringBuilder respBuilder = new StringBuilder(
+                    "{\"acknowledged\":true,\"index\":\"" + index + "\",\"pipeline\":\"" + pipelineName + "\",\"fields\":["
+                );
+                boolean respFirst = true;
+                for (String[] vf : validatedFields) {
+                    if (!respFirst) respBuilder.append(",");
+                    String modelId = "unknown";
+                    if (finalUpdatedProps != null && finalUpdatedProps.get(vf[1]) instanceof Map) {
+                        Object mid = ((Map<String, Object>) finalUpdatedProps.get(vf[1])).get("model_id");
+                        if (mid != null) modelId = mid.toString();
                     }
-                });
+                    respBuilder.append(
+                        String.format(
+                            Locale.ROOT,
+                            "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"model_id\":\"%s\",\"status\":\"ENABLED\"}",
+                            vf[0],
+                            vf[1],
+                            modelId
+                        )
+                    );
+                    respFirst = false;
+                }
+                respBuilder.append("]}");
+                try {
+                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
+                } catch (Exception e) {
+                    log.error("Failed to send response", e);
+                }
             }
 
             @Override
             public void onFailure(Exception e) {
-                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create search pipeline: " + e.getMessage());
+                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Pipeline created but failed to set as default: " + e.getMessage());
             }
         });
     }
