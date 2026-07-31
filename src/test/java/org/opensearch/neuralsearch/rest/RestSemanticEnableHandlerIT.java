@@ -222,6 +222,58 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
         assertTrue("Should mention ASE-managed conflict", responseBody.contains("ASE-managed"));
     }
 
+    @SneakyThrows
+    public void testEnableEnrichment_ingestPipelineRemovesSourceField_returns409() {
+        // Customer has an ingest pipeline that removes the source field — this would
+        // break SemanticFieldProcessor which needs to read the field after ingest.
+        String ingestPipeline = "customer-ingest-pipeline";
+        try {
+            putIngestPipelineRaw(ingestPipeline, "{\"processors\":[{\"remove\":{\"field\":\"title\"}}]}");
+            createIndex(
+                INDEX_NAME,
+                "{\"settings\":{\"index.default_pipeline\":\""
+                    + ingestPipeline
+                    + "\"},"
+                    + "\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}"
+            );
+
+            ResponseException ex = expectThrows(ResponseException.class, () -> enableEnrichment(INDEX_NAME, "title", "title_semantic"));
+
+            assertEquals(409, ex.getResponse().getStatusLine().getStatusCode());
+            String responseBody = EntityUtils.toString(ex.getResponse().getEntity());
+            assertTrue("Should mention the ingest pipeline conflict", responseBody.contains("ingest pipeline"));
+            assertTrue("Should mention removes field", responseBody.contains("removes field"));
+        } finally {
+            try {
+                deleteIngestPipeline(ingestPipeline);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_ingestPipelineSafeProcessor_succeeds() {
+        // Customer has an ingest pipeline with a lowercase processor — safe, doesn't remove anything.
+        String ingestPipeline = "customer-ingest-safe";
+        try {
+            putIngestPipelineRaw(ingestPipeline, "{\"processors\":[{\"lowercase\":{\"field\":\"title\"}}]}");
+            createIndex(
+                INDEX_NAME,
+                "{\"settings\":{\"index.default_pipeline\":\""
+                    + ingestPipeline
+                    + "\"},"
+                    + "\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}"
+            );
+
+            Response response = enableEnrichment(INDEX_NAME, "title", "title_semantic");
+
+            assertEquals(200, response.getStatusLine().getStatusCode());
+        } finally {
+            try {
+                deleteIngestPipeline(ingestPipeline);
+            } catch (Exception ignored) {}
+        }
+    }
+
     // --- Helpers ---
 
     private Response enableEnrichment(String index, String originalField, String semanticField) throws Exception {
@@ -277,6 +329,17 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
             "/" + index + "/_settings",
             null,
             toHttpEntity(settingsJson),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+    }
+
+    private void putIngestPipelineRaw(String name, String body) throws Exception {
+        makeRequest(
+            client(),
+            "PUT",
+            "/_ingest/pipeline/" + name,
+            null,
+            toHttpEntity(body),
             ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
         );
     }

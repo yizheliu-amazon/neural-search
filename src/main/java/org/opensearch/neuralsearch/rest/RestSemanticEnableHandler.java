@@ -8,6 +8,9 @@ import com.google.common.collect.ImmutableList;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
+import org.opensearch.action.ingest.GetPipelineAction;
+import org.opensearch.action.ingest.GetPipelineRequest;
+import org.opensearch.action.ingest.GetPipelineResponse;
 import org.opensearch.action.search.GetSearchPipelineAction;
 import org.opensearch.action.search.GetSearchPipelineRequest;
 import org.opensearch.action.search.GetSearchPipelineResponse;
@@ -263,12 +266,11 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         // Once PutMapping succeeds below, we build and PUT the merged pipeline directly via
         // buildMergedSearchPipeline WITHOUT re-checking — see PipelineMergeUtil javadoc for why.
         //
-        // NOTE: there is no equivalent ingest-pipeline pre-check here. The `semantic` field
-        // type generates embeddings via SemanticFieldProcessor, a system-generated ingest
-        // processor -- there is no customer-visible ingest pipeline for this feature to
-        // merge into (confirmed with Yizhe). PipelineMergeUtil.checkIngestPipelineConflicts /
-        // buildMergedIngestPipeline remain available as a utility for other ASE
-        // implementations that DO use a customer-visible ingest pipeline.
+        // NOTE: ASE does not add processors to the customer's ingest pipeline. The
+        // `semantic` field type generates embeddings via SemanticFieldProcessor (a
+        // system-generated processor that runs after the ingest pipeline). However,
+        // if the customer HAS an ingest pipeline, we must check that it doesn't
+        // remove/rename the source field before SemanticFieldProcessor can read it.
         String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
         String existingDefaultPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
         String pipelineToCheck = (existingDefaultPipeline != null && !existingDefaultPipeline.endsWith(SEARCH_PIPELINE_SUFFIX))
@@ -296,15 +298,76 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
                             return;
                         }
                     }
-                    proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+                    checkIngestPipelineAndProceed(index, mappingSource, validatedFields, client, channel);
                 }
 
                 @Override
                 public void onFailure(Exception e) {
                     // GET failing typically means the pipeline doesn't exist yet — nothing to conflict with.
-                    proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+                    checkIngestPipelineAndProceed(index, mappingSource, validatedFields, client, channel);
                 }
             });
+    }
+
+    /**
+     * Check the index's default ingest pipeline (if any) for conflicts with the source fields
+     * that SemanticFieldProcessor will read. If the ingest pipeline removes or renames a source
+     * field, the system processor won't be able to generate embeddings.
+     */
+    @SuppressWarnings("unchecked")
+    private void checkIngestPipelineAndProceed(
+        String index,
+        String mappingSource,
+        List<String[]> validatedFields,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
+        String ingestPipeline = indexMetadata.getSettings().get("index.default_pipeline");
+
+        if (ingestPipeline == null || "_none".equals(ingestPipeline)) {
+            // No ingest pipeline — nothing to conflict with.
+            proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+            return;
+        }
+
+        // Collect source fields from the validated field specs
+        Set<String> sourceFields = new java.util.HashSet<>();
+        for (String[] vf : validatedFields) {
+            sourceFields.add(vf[0]); // original_field
+        }
+
+        GetPipelineRequest ingestCheckRequest = new GetPipelineRequest(ingestPipeline);
+        client.admin().cluster().execute(GetPipelineAction.INSTANCE, ingestCheckRequest, new ActionListener<GetPipelineResponse>() {
+            @Override
+            public void onResponse(GetPipelineResponse getResponse) {
+                if (getResponse.isFound() && getResponse.pipelines() != null && !getResponse.pipelines().isEmpty()) {
+                    Map<String, Object> pipelineConfig = getResponse.pipelines().get(0).getConfigAsMap();
+                    List<Map<String, Object>> processors = (List<Map<String, Object>>) pipelineConfig.get("processors");
+                    if (processors != null) {
+                        List<String> conflicts = PipelineMergeUtil.scanIngestConflicts(processors, sourceFields);
+                        if (!conflicts.isEmpty()) {
+                            sendError(
+                                channel,
+                                RestStatus.CONFLICT,
+                                "Cannot enable ASE: existing ingest pipeline ["
+                                    + ingestPipeline
+                                    + "] has a blocking conflict: "
+                                    + String.join("; ", conflicts)
+                            );
+                            return;
+                        }
+                    }
+                }
+                proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                // GET failing typically means the pipeline doesn't exist yet — nothing to conflict with.
+                proceedWithPutMapping(index, mappingSource, validatedFields, client, channel);
+            }
+        });
     }
 
     private void proceedWithPutMapping(
