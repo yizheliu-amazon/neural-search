@@ -382,4 +382,282 @@ public class PipelineMergeUtilTests extends OpenSearchTestCase {
 
         assertTrue(conflicts.isEmpty());
     }
+
+    // =========================================================================
+    // SEARCH MERGE - ADDITIONAL SAFE PROCESSORS (per CONFLICT-REFERENCE.md)
+    // =========================================================================
+
+    public void testSearchMerge_oversampleAndTruncateHits_safe() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(proc("oversample", Map.of("sample_factor", 2.0)), proc("truncate_hits", Map.of("target_size", 10)))
+        );
+        MergeResult result = mergeSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertTrue(result.canMerge());
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) result.getMergedPipeline().get(REQUEST_PROCESSORS_KEY);
+        assertEquals(4, procs.size());
+        // ASE processors prepended
+        assertTrue(procs.get(0).containsKey(SEMANTIC_SEARCH_REWRITE_PROCESSOR));
+        assertTrue(procs.get(1).containsKey(NEURAL_SPARSE_TWO_PHASE_PROCESSOR));
+        // Customer processors preserved in order
+        assertTrue(procs.get(2).containsKey("oversample"));
+        assertTrue(procs.get(3).containsKey("truncate_hits"));
+    }
+
+    public void testSearchMerge_scriptProcessor_safe() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(proc("script", Map.of("lang", "painless", "source", "ctx._source.size = 20")))
+        );
+        MergeResult result = mergeSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertTrue(result.canMerge());
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) result.getMergedPipeline().get(REQUEST_PROCESSORS_KEY);
+        assertEquals(3, procs.size());
+        assertTrue(procs.get(2).containsKey("script"));
+    }
+
+    public void testSearchMerge_multipleCustomerProcessors_orderPreserved() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(
+                proc("neural_query_enricher", Map.of("default_model_id", "model-1")),
+                proc("filter_query", Map.of("query", Map.of("term", Map.of("status", "published")))),
+                proc("script", Map.of("lang", "painless", "source", "ctx._source.explain = true"))
+            )
+        );
+        MergeResult result = mergeSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertTrue(result.canMerge());
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) result.getMergedPipeline().get(REQUEST_PROCESSORS_KEY);
+        assertEquals(5, procs.size());
+        // ASE first
+        assertTrue(procs.get(0).containsKey(SEMANTIC_SEARCH_REWRITE_PROCESSOR));
+        assertTrue(procs.get(1).containsKey(NEURAL_SPARSE_TWO_PHASE_PROCESSOR));
+        // Customer processors in original order
+        assertTrue(procs.get(2).containsKey("neural_query_enricher"));
+        assertTrue(procs.get(3).containsKey("filter_query"));
+        assertTrue(procs.get(4).containsKey("script"));
+    }
+
+    // =========================================================================
+    // SEARCH MERGE - SPLIT API (checkSearchPipelineConflicts + buildMergedSearchPipeline)
+    // =========================================================================
+
+    public void testCheckSearchPipelineConflicts_noConflict_emptyList() {
+        Map<String, Object> pipeline = searchPipeline(List.of(proc("filter_query", Map.of("query", Map.of("term", Map.of("x", "y"))))));
+        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(pipeline);
+
+        assertTrue(conflicts.isEmpty());
+    }
+
+    public void testCheckSearchPipelineConflicts_existingNonAseRewrite_detected() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(proc(SEMANTIC_SEARCH_REWRITE_PROCESSOR, Map.of("analyzer", "custom", FIELD_MAP_KEY, Map.of("x", "y"))))
+        );
+        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(pipeline);
+
+        assertEquals(1, conflicts.size());
+        assertTrue(conflicts.get(0).contains("double-rewriting"));
+    }
+
+    public void testCheckSearchPipelineConflicts_existingNonAseTwoPhase_detected() {
+        Map<String, Object> pipeline = searchPipeline(List.of(proc(NEURAL_SPARSE_TWO_PHASE_PROCESSOR, Map.of("enabled", true))));
+        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(pipeline);
+
+        assertEquals(1, conflicts.size());
+        assertTrue(conflicts.get(0).contains("neural_sparse_two_phase_processor"));
+    }
+
+    public void testCheckSearchPipelineConflicts_aseAlreadyPresent_detected() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(proc(SEMANTIC_SEARCH_REWRITE_PROCESSOR, Map.of(TAG_KEY, ASE_MANAGED_TAG, FIELD_MAP_KEY, Map.of("x", "y"))))
+        );
+        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(pipeline);
+
+        assertEquals(1, conflicts.size());
+        assertTrue(conflicts.get(0).contains("ASE-managed"));
+    }
+
+    public void testCheckSearchPipelineConflicts_multipleConflicts_allReported() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(
+                proc(SEMANTIC_SEARCH_REWRITE_PROCESSOR, Map.of("analyzer", "custom", FIELD_MAP_KEY, Map.of("x", "y"))),
+                proc(NEURAL_SPARSE_TWO_PHASE_PROCESSOR, Map.of("enabled", true))
+            )
+        );
+        List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(pipeline);
+
+        assertEquals(2, conflicts.size());
+    }
+
+    public void testBuildMergedSearchPipeline_prependsAseProcessors() {
+        Map<String, Object> pipeline = searchPipeline(
+            List.of(proc("filter_query", Map.of("query", Map.of("term", Map.of("status", "active")))))
+        );
+        Map<String, Object> merged = PipelineMergeUtil.buildMergedSearchPipeline(pipeline, aseSearchProcessors());
+
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) merged.get(REQUEST_PROCESSORS_KEY);
+        assertEquals(3, procs.size());
+        assertTrue(procs.get(0).containsKey(SEMANTIC_SEARCH_REWRITE_PROCESSOR));
+        assertTrue(procs.get(1).containsKey(NEURAL_SPARSE_TWO_PHASE_PROCESSOR));
+        assertTrue(procs.get(2).containsKey("filter_query"));
+    }
+
+    public void testBuildMergedSearchPipeline_preservesDescription() {
+        Map<String, Object> pipeline = new LinkedHashMap<>();
+        pipeline.put("description", "My custom search pipeline");
+        pipeline.put(
+            REQUEST_PROCESSORS_KEY,
+            new ArrayList<>(List.of(proc("filter_query", Map.of("query", Map.of("term", Map.of("x", "y"))))))
+        );
+
+        Map<String, Object> merged = PipelineMergeUtil.buildMergedSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertEquals("My custom search pipeline", merged.get("description"));
+    }
+
+    public void testBuildMergedSearchPipeline_preservesResponseProcessors() {
+        Map<String, Object> pipeline = new LinkedHashMap<>();
+        pipeline.put(REQUEST_PROCESSORS_KEY, new ArrayList<>(List.of(proc("filter_query", Map.of("query", Map.of("x", "y"))))));
+        List<Map<String, Object>> responseProcessors = List.of(Map.of("rename_field", Map.of("field", "a", "target_field", "b")));
+        pipeline.put("response_processors", responseProcessors);
+
+        Map<String, Object> merged = PipelineMergeUtil.buildMergedSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertEquals(responseProcessors, merged.get("response_processors"));
+    }
+
+    public void testBuildMergedSearchPipeline_emptyExistingPipeline() {
+        Map<String, Object> pipeline = searchPipeline(List.of());
+        Map<String, Object> merged = PipelineMergeUtil.buildMergedSearchPipeline(pipeline, aseSearchProcessors());
+
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) merged.get(REQUEST_PROCESSORS_KEY);
+        assertEquals(2, procs.size());
+        assertTrue(procs.get(0).containsKey(SEMANTIC_SEARCH_REWRITE_PROCESSOR));
+        assertTrue(procs.get(1).containsKey(NEURAL_SPARSE_TWO_PHASE_PROCESSOR));
+    }
+
+    // =========================================================================
+    // INGEST MERGE - SPLIT API (checkIngestPipelineConflicts)
+    // =========================================================================
+
+    public void testCheckIngestPipelineConflicts_noConflict_emptyList() {
+        Map<String, Object> pipeline = ingestPipeline(List.of(proc("lowercase", Map.of("field", "text"))));
+        List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipeline, SOURCE_FIELDS);
+
+        assertTrue(conflicts.isEmpty());
+    }
+
+    public void testCheckIngestPipelineConflicts_removeSourceField_detected() {
+        Map<String, Object> pipeline = ingestPipeline(List.of(proc("remove", Map.of("field", "text"))));
+        List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipeline, SOURCE_FIELDS);
+
+        assertEquals(1, conflicts.size());
+        assertTrue(conflicts.get(0).contains("removes field 'text'"));
+    }
+
+    public void testCheckIngestPipelineConflicts_aseAlreadyPresent_detected() {
+        Map<String, Object> pipeline = ingestPipeline(
+            List.of(proc(SPARSE_ENCODING_PROCESSOR, Map.of(TAG_KEY, ASE_MANAGED_TAG, "model_id", MODEL_ID)))
+        );
+        List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipeline, SOURCE_FIELDS);
+
+        assertFalse(conflicts.isEmpty());
+        assertTrue(conflicts.stream().anyMatch(c -> c.contains("ASE-managed")));
+    }
+
+    public void testCheckIngestPipelineConflicts_nonAseSparseEncoding_detected() {
+        Map<String, Object> pipeline = ingestPipeline(
+            List.of(proc(SPARSE_ENCODING_PROCESSOR, Map.of("model_id", "other-model", FIELD_MAP_KEY, Map.of("x", "y"))))
+        );
+        List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipeline, SOURCE_FIELDS);
+
+        assertFalse(conflicts.isEmpty());
+        assertTrue(conflicts.stream().anyMatch(c -> c.contains("sparse_encoding")));
+    }
+
+    // =========================================================================
+    // INGEST MERGE - MULTIPLE SOURCE FIELDS
+    // =========================================================================
+
+    public void testIngestMerge_multipleSourceFields_oneConflicting() {
+        Set<String> multiFields = Set.of("title", "body");
+        Map<String, Object> pipeline = ingestPipeline(List.of(proc("remove", Map.of("field", "title"))));
+
+        Map<String, Object> aseProc = new LinkedHashMap<>();
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put(TAG_KEY, ASE_MANAGED_TAG);
+        config.put("model_id", MODEL_ID);
+        config.put(FIELD_MAP_KEY, Map.of("title", "title_sparse", "body", "body_sparse"));
+        aseProc.put(SPARSE_ENCODING_PROCESSOR, config);
+
+        MergeResult result = mergeIngestPipeline(pipeline, multiFields, aseProc);
+
+        assertFalse(result.canMerge());
+        assertEquals(1, result.getConflicts().size());
+        assertTrue(result.getConflicts().get(0).contains("title"));
+    }
+
+    public void testIngestMerge_multipleSourceFields_noneConflicting() {
+        Set<String> multiFields = Set.of("title", "body");
+        Map<String, Object> pipeline = ingestPipeline(List.of(proc("lowercase", Map.of("field", "title"))));
+
+        Map<String, Object> aseProc = new LinkedHashMap<>();
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put(TAG_KEY, ASE_MANAGED_TAG);
+        config.put("model_id", MODEL_ID);
+        config.put(FIELD_MAP_KEY, Map.of("title", "title_sparse", "body", "body_sparse"));
+        aseProc.put(SPARSE_ENCODING_PROCESSOR, config);
+
+        MergeResult result = mergeIngestPipeline(pipeline, multiFields, aseProc);
+
+        assertTrue(result.canMerge());
+    }
+
+    public void testIngestMerge_multipleSourceFields_removeUnrelated_safe() {
+        Set<String> multiFields = Set.of("title", "body");
+        Map<String, Object> pipeline = ingestPipeline(List.of(proc("remove", Map.of("field", "internal_id"))));
+
+        Map<String, Object> aseProc = new LinkedHashMap<>();
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put(TAG_KEY, ASE_MANAGED_TAG);
+        config.put("model_id", MODEL_ID);
+        config.put(FIELD_MAP_KEY, Map.of("title", "title_sparse", "body", "body_sparse"));
+        aseProc.put(SPARSE_ENCODING_PROCESSOR, config);
+
+        MergeResult result = mergeIngestPipeline(pipeline, multiFields, aseProc);
+
+        assertTrue(result.canMerge());
+    }
+
+    // =========================================================================
+    // SEARCH MERGE - EDGE CASES
+    // =========================================================================
+
+    public void testSearchMerge_nullRequestProcessors_treatedAsEmpty() {
+        // Pipeline exists but has no request_processors key at all
+        Map<String, Object> pipeline = new LinkedHashMap<>();
+        pipeline.put("description", "pipeline with only response processors");
+        pipeline.put("response_processors", List.of(Map.of("rename_field", Map.of("field", "a", "target_field", "b"))));
+
+        MergeResult result = mergeSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertTrue(result.canMerge());
+        List<Map<String, Object>> procs = (List<Map<String, Object>>) result.getMergedPipeline().get(REQUEST_PROCESSORS_KEY);
+        assertEquals(2, procs.size());
+        assertTrue(procs.get(0).containsKey(SEMANTIC_SEARCH_REWRITE_PROCESSOR));
+        assertTrue(procs.get(1).containsKey(NEURAL_SPARSE_TWO_PHASE_PROCESSOR));
+        // Response processors preserved
+        assertTrue(result.getMergedPipeline().containsKey("response_processors"));
+    }
+
+    public void testSearchMerge_phaseResultsProcessors_preserved() {
+        Map<String, Object> pipeline = new LinkedHashMap<>();
+        pipeline.put(REQUEST_PROCESSORS_KEY, new ArrayList<>(List.of(proc("filter_query", Map.of("query", Map.of("x", "y"))))));
+        pipeline.put("phase_results_processors", List.of(Map.of("normalization-processor", Map.of("technique", "min_max"))));
+
+        MergeResult result = mergeSearchPipeline(pipeline, aseSearchProcessors());
+
+        assertTrue(result.canMerge());
+        assertTrue(result.getMergedPipeline().containsKey("phase_results_processors"));
+    }
 }

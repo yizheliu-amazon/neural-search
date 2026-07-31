@@ -102,6 +102,126 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
         assertTrue(responseBody.contains("ASE-managed"));
     }
 
+    @SneakyThrows
+    public void testEnableEnrichment_existingPipelineWithResponseProcessors_preserved() {
+        createIndex(INDEX_NAME, "{\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}");
+
+        // Customer pipeline has both request and response processors
+        String customerPipeline = "customer-pipeline-it";
+        putSearchPipelineRaw(
+            customerPipeline,
+            "{\"request_processors\":[{\"filter_query\":{\"tag\":\"customer\",\"query\":{\"match_all\":{}}}}],"
+                + "\"response_processors\":[{\"rename_field\":{\"field\":\"_score\",\"target_field\":\"relevance\"}}]}"
+        );
+        updateIndexSettings(INDEX_NAME, "{\"index.search.default_pipeline\":\"" + customerPipeline + "\"}");
+
+        Response response = enableEnrichment(INDEX_NAME, "title", "title_semantic");
+
+        assertEquals(200, response.getStatusLine().getStatusCode());
+
+        // Verify response_processors survived the merge
+        Map<String, Object> pipeline = getSearchPipelineRaw(INDEX_NAME + "-semantic-search-pipeline");
+        java.util.List<Map<String, Object>> requestProcs = (java.util.List<Map<String, Object>>) pipeline.get("request_processors");
+        assertTrue("ASE rewrite should be in merged pipeline", requestProcs.get(0).containsKey("semantic_search_rewrite_processor"));
+        java.util.List<Map<String, Object>> responseProcs = (java.util.List<Map<String, Object>>) pipeline.get("response_processors");
+        assertNotNull("response_processors should be preserved after merge", responseProcs);
+        assertEquals(1, responseProcs.size());
+        assertTrue(responseProcs.get(0).containsKey("rename_field"));
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_multipleFields_succeeds() {
+        createIndex(INDEX_NAME, "{\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}");
+
+        // Enable with multiple fields via the "fields" array syntax
+        String body = "{\"fields\":["
+            + "{\"original_field\":\"title\",\"semantic_field\":\"title_semantic\",\"model_type\":\"SPARSE\"},"
+            + "{\"original_field\":\"body\",\"semantic_field\":\"body_semantic\",\"model_type\":\"SPARSE\"}"
+            + "]}";
+        Response response = makeRequest(
+            client(),
+            "POST",
+            NEURAL_BASE_URI + "/semantic/" + INDEX_NAME + "/enable_semantic_enrichment",
+            null,
+            toHttpEntity(body),
+            ImmutableList.of(new BasicHeader(HttpHeaders.USER_AGENT, DEFAULT_USER_AGENT))
+        );
+
+        assertEquals(200, response.getStatusLine().getStatusCode());
+
+        // Verify the pipeline was created with both fields in the field_map
+        Map<String, Object> pipeline = getSearchPipelineRaw(INDEX_NAME + "-semantic-search-pipeline");
+        java.util.List<Map<String, Object>> procs = (java.util.List<Map<String, Object>>) pipeline.get("request_processors");
+        assertNotNull(procs);
+        assertTrue(procs.get(0).containsKey("semantic_search_rewrite_processor"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> rewriteConfig = (Map<String, Object>) procs.get(0).get("semantic_search_rewrite_processor");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> fieldMap = (Map<String, Object>) rewriteConfig.get("field_map");
+        assertTrue("field_map should contain title_semantic", fieldMap.containsKey("title_semantic"));
+        assertTrue("field_map should contain body_semantic", fieldMap.containsKey("body_semantic"));
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_nonExistentSourceField_returns400() {
+        createIndex(INDEX_NAME, "{\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}");
+
+        ResponseException ex = expectThrows(
+            ResponseException.class,
+            () -> enableEnrichment(INDEX_NAME, "nonexistent_field", "nonexistent_semantic")
+        );
+
+        assertEquals(400, ex.getResponse().getStatusLine().getStatusCode());
+        String responseBody = EntityUtils.toString(ex.getResponse().getEntity());
+        assertTrue(responseBody.contains("does not exist"));
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_incompatibleFieldType_returns400() {
+        // Create index with a boolean field (not in COMPATIBLE_TYPES)
+        createIndex(INDEX_NAME, "{\"mappings\":{\"properties\":{\"is_active\":{\"type\":\"boolean\"}}}}");
+
+        ResponseException ex = expectThrows(ResponseException.class, () -> enableEnrichment(INDEX_NAME, "is_active", "is_active_semantic"));
+
+        assertEquals(400, ex.getResponse().getStatusLine().getStatusCode());
+        String responseBody = EntityUtils.toString(ex.getResponse().getEntity());
+        assertTrue(responseBody.contains("not compatible"));
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_nonExistentIndex_returns404() {
+        ResponseException ex = expectThrows(
+            ResponseException.class,
+            () -> enableEnrichment("index-that-does-not-exist", "title", "title_semantic")
+        );
+
+        assertEquals(404, ex.getResponse().getStatusLine().getStatusCode());
+        String responseBody = EntityUtils.toString(ex.getResponse().getEntity());
+        assertTrue(responseBody.contains("does not exist"));
+    }
+
+    @SneakyThrows
+    public void testEnableEnrichment_existingPipelineWithMultipleConflicts_returns409() {
+        createIndex(INDEX_NAME, "{\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}");
+
+        // Pipeline with BOTH ASE-managed processors already present — simulates calling
+        // enable twice without disable in between. Both should be detected as conflicts.
+        String aseNamedPipeline = INDEX_NAME + "-semantic-search-pipeline";
+        putSearchPipelineRaw(
+            aseNamedPipeline,
+            "{\"request_processors\":["
+                + "{\"semantic_search_rewrite_processor\":{\"tag\":\"ase_managed\",\"field_map\":{\"old_field\":{\"type\":\"sparse\",\"target_field\":\"old_embedding\",\"model_id\":\"old-model\"}}}},"
+                + "{\"neural_sparse_two_phase_processor\":{\"tag\":\"ase_managed\",\"enabled\":true}}"
+                + "]}"
+        );
+
+        ResponseException ex = expectThrows(ResponseException.class, () -> enableEnrichment(INDEX_NAME, "title", "title_semantic"));
+
+        assertEquals(409, ex.getResponse().getStatusLine().getStatusCode());
+        String responseBody = EntityUtils.toString(ex.getResponse().getEntity());
+        assertTrue("Should mention ASE-managed conflict", responseBody.contains("ASE-managed"));
+    }
+
     // --- Helpers ---
 
     private Response enableEnrichment(String index, String originalField, String semanticField) throws Exception {
