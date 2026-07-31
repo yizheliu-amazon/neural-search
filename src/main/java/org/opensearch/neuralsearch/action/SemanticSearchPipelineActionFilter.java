@@ -9,7 +9,6 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.create.CreateIndexAction;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingAction;
-import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.PutSearchPipelineRequest;
 import org.opensearch.action.support.ActionFilter;
@@ -87,31 +86,18 @@ public class SemanticSearchPipelineActionFilter implements ActionFilter {
                 }
             });
         } else if (PutMappingAction.NAME.equals(action)) {
-            // Pre-check: reject if index has a non-ASE search pipeline and request adds semantic fields
-            try {
-                checkSearchPipelineConflict(request);
-            } catch (IllegalArgumentException e) {
-                listener.onFailure(e);
-                return;
-            }
-            chain.proceed(task, action, request, new ActionListener<Response>() {
-                @Override
-                public void onResponse(Response response) {
-                    if (response instanceof AcknowledgedResponse ack && ack.isAcknowledged()) {
-                        try {
-                            handlePutMappingResponse(request);
-                        } catch (Exception e) {
-                            log.warn("Failed to update search pipeline after PutMapping: {}", e.getMessage());
-                        }
-                    }
-                    listener.onResponse(response);
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    listener.onFailure(e);
-                }
-            });
+            // Pipeline validation and creation for the PutMapping path is handled by
+            // RestSemanticEnableHandler.createSearchPipelineForEnrichment, which performs
+            // merge-aware conflict detection (PipelineMergeUtil.checkSearchPipelineConflicts)
+            // BEFORE PutMapping and constructs a merged pipeline AFTER PutMapping succeeds.
+            //
+            // The original code here had two responsibilities that are now both handled
+            // by the handler:
+            // 1. Pre-check: blanket-rejected any non-ASE-named pipeline (replaced by
+            // merge-aware checkSearchPipelineConflicts in the handler)
+            // 2. Post-action: unconditionally created a fresh pipeline after PutMapping
+            // (replaced by buildMergedSearchPipeline which preserves customer processors)
+            chain.proceed(task, action, request, listener);
         } else {
             chain.proceed(task, action, request, listener);
         }
