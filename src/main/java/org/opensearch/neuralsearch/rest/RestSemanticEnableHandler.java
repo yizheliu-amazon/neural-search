@@ -10,12 +10,12 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
 import org.opensearch.action.search.GetSearchPipelineAction;
 import org.opensearch.action.search.GetSearchPipelineRequest;
-import org.opensearch.action.search.GetSearchPipelineResponse;
 import org.opensearch.action.search.PutSearchPipelineAction;
 import org.opensearch.action.search.PutSearchPipelineRequest;
-import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
+import org.opensearch.action.ingest.GetPipelineRequest;
+import org.opensearch.action.ingest.GetPipelineResponse;
+import org.opensearch.action.ingest.PutPipelineRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -26,7 +26,6 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestChannel;
-import org.opensearch.search.pipeline.PipelineConfiguration;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -39,22 +38,24 @@ import java.util.Set;
 import java.util.StringJoiner;
 
 /**
- * REST handler for semantic field enable/disable APIs.
+ * REST handler for semantic enrichment lifecycle APIs.
+ *
+ * Uses a customer-visible default ingest pipeline with standard set(copy)/rename processors
+ * for data routing. The semantic field's system ingest processor handles embedding generation
+ * independently — zero changes to semantic field internals.
  *
  * POST /_plugins/_neural/semantic/{index}/enable_semantic_enrichment
  * POST /_plugins/_neural/semantic/{index}/disable_semantic_enrichment
  * POST /_plugins/_neural/semantic/{index}/deploy_semantic_enrichment
  * POST /_plugins/_neural/semantic/{index}/rollback_semantic_enrichment
  * GET  /_plugins/_neural/semantic/{index}/list_semantic_enrichment
- *
- * All POST APIs accept a "fields" array for batch operations. Each entry has
- * original_field + semantic_field (+ optional language / model_type).
  */
 public class RestSemanticEnableHandler extends BaseRestHandler {
 
     private static final Logger log = LogManager.getLogger(RestSemanticEnableHandler.class);
     private static final String SEMANTIC_ENABLE_ACTION = "neural_semantic_enable_action";
-    private static final String SEARCH_PIPELINE_SUFFIX = "-semantic-search-pipeline";
+    private static final String INGEST_PIPELINE_SUFFIX = "-ase-ingest-pipeline";
+    private static final String SEARCH_PIPELINE_SUFFIX = "-ase-search-pipeline";
     private static final String FIELD_REPLACEMENT_PROCESSOR_TYPE = "field_replacement_processor";
     private static final Set<String> COMPATIBLE_TYPES = Set.of("text", "keyword", "match_only_text", "wildcard", "token_count", "binary");
 
@@ -85,623 +86,280 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         String index = request.param("index");
         String path = request.path();
-
-        if (path.endsWith("/list_semantic_enrichment")) {
-            return channel -> handleList(index, client, channel);
-        }
-
+        if (path.endsWith("/list_semantic_enrichment")) return channel -> handleList(index, client, channel);
         Map<String, Object> body = request.contentParser().map();
-
-        if (path.endsWith("/enable_semantic_enrichment")) {
-            return channel -> handleEnableEnrichment(index, body, client, channel);
-        } else if (path.endsWith("/disable_semantic_enrichment")) {
-            return channel -> handleDisableEnrichment(index, body, client, channel);
-        } else if (path.endsWith("/deploy_semantic_enrichment")) {
-            return channel -> handleDeploy(index, body, client, channel);
-        } else if (path.endsWith("/rollback_semantic_enrichment")) {
-            return channel -> handleRollback(index, body, client, channel);
-        } else {
-            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "Unknown action: " + path));
-        }
+        if (path.endsWith("/enable_semantic_enrichment")) return channel -> handleEnable(index, body, client, channel);
+        if (path.endsWith("/disable_semantic_enrichment")) return channel -> handleDisable(index, body, client, channel);
+        if (path.endsWith("/deploy_semantic_enrichment")) return channel -> handleDeploy(index, body, client, channel);
+        if (path.endsWith("/rollback_semantic_enrichment")) return channel -> handleRollback(index, body, client, channel);
+        return channel -> sendError(channel, RestStatus.BAD_REQUEST, "Unknown action: " + path);
     }
 
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> extractFields(Map<String, Object> body) {
         Object fieldsObj = body.get("fields");
-        if (fieldsObj instanceof List<?>) {
-            return (List<Map<String, Object>>) fieldsObj;
-        }
-        // Support single-field shorthand (backward compat)
-        if (body.containsKey("original_field")) {
-            return List.of(body);
-        }
+        if (fieldsObj instanceof List<?>) return (List<Map<String, Object>>) fieldsObj;
+        if (body.containsKey("original_field")) return List.of(body);
         return null;
     }
 
-    // ========================= enable_semantic_enrichment =========================
+    // ========================= enable =========================
 
     @SuppressWarnings("unchecked")
-    private void handleEnableEnrichment(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
+    private void handleEnable(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
         List<Map<String, Object>> fields = extractFields(body);
         if (fields == null || fields.isEmpty()) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Request must contain 'fields' array or original_field/semantic_field params");
+            sendError(channel, RestStatus.BAD_REQUEST, "fields required");
             return;
         }
 
-        // Validate index exists
         IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
         if (indexMetadata == null) {
             sendError(channel, RestStatus.NOT_FOUND, "Index [" + index + "] does not exist");
             return;
         }
 
-        MappingMetadata mappingMetadata = indexMetadata.mapping();
-        if (mappingMetadata == null) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Index [" + index + "] has no mapping");
-            return;
+        Map<String, Object> properties = indexMetadata.mapping() != null
+            ? (Map<String, Object>) indexMetadata.mapping().sourceAsMap().get("properties")
+            : Map.of();
+
+        List<String[]> validated = new ArrayList<>();
+        for (Map<String, Object> f : fields) {
+            String orig = (String) f.get("original_field");
+            String sem = (String) f.get("semantic_field");
+            String lang = (String) f.getOrDefault("language", "ENGLISH");
+            String mtype = (String) f.getOrDefault("model_type", "SPARSE");
+            if (orig == null || orig.isEmpty()) {
+                sendError(channel, RestStatus.BAD_REQUEST, "original_field required");
+                return;
+            }
+            if (sem == null || sem.isEmpty()) {
+                sendError(channel, RestStatus.BAD_REQUEST, "semantic_field required");
+                return;
+            }
+            if (properties.get(orig) == null) {
+                sendError(channel, RestStatus.BAD_REQUEST, "original_field [" + orig + "] not found");
+                return;
+            }
+            validated.add(new String[] { orig, sem, lang, mtype });
         }
 
-        Map<String, Object> mappingMap = mappingMetadata.sourceAsMap();
-        Map<String, Object> properties = (Map<String, Object>) mappingMap.get("properties");
-        if (properties == null) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Index [" + index + "] has no properties in mapping");
-            return;
-        }
-
-        // Check for non-ASE pipeline conflict
-        String currentPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
-        if (currentPipeline != null && !currentPipeline.endsWith(SEARCH_PIPELINE_SUFFIX)) {
-            sendError(
-                channel,
-                RestStatus.BAD_REQUEST,
-                "Index [" + index + "] already has a non-ASE search pipeline [" + currentPipeline + "]"
-            );
-            return;
-        }
-
-        // Validate all fields first
-        StringBuilder mappingBuilder = new StringBuilder("{\"properties\":{");
+        // PutMapping: create semantic field
+        StringBuilder mb = new StringBuilder("{\"properties\":{");
         boolean first = true;
-        List<String[]> validatedFields = new ArrayList<>();
-
-        for (Map<String, Object> fieldSpec : fields) {
-            String originalField = (String) fieldSpec.get("original_field");
-            String semanticField = (String) fieldSpec.get("semantic_field");
-            String language = (String) fieldSpec.getOrDefault("language", "ENGLISH");
-            String modelType = (String) fieldSpec.getOrDefault("model_type", "SPARSE");
-
-            if (originalField == null || originalField.isEmpty()) {
-                sendError(channel, RestStatus.BAD_REQUEST, "original_field is required for each field entry");
-                return;
-            }
-            if (semanticField == null || semanticField.isEmpty()) {
-                sendError(channel, RestStatus.BAD_REQUEST, "semantic_field is required for each field entry");
-                return;
-            }
-
-            // Validate original_field exists
-            Object originalFieldDef = properties.get(originalField);
-            if (originalFieldDef == null) {
-                sendError(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "original_field [" + originalField + "] does not exist in index [" + index + "]"
-                );
-                return;
-            }
-
-            // Validate type compatibility
-            if (originalFieldDef instanceof Map) {
-                String originalType = (String) ((Map<String, Object>) originalFieldDef).get("type");
-                if (originalType != null && !COMPATIBLE_TYPES.contains(originalType)) {
-                    sendError(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "original_field ["
-                            + originalField
-                            + "] has type ["
-                            + originalType
-                            + "] which is not compatible. Compatible types: "
-                            + COMPATIBLE_TYPES
-                    );
-                    return;
-                }
-            }
-
-            // Check no OTHER semantic field already enriches this original_field.
-            // Skip the target semantic field itself so that re-enabling an existing (e.g. previously
-            // DISABLED) enrichment is allowed — the field legitimately already has this original_field.
-            for (Map.Entry<String, Object> entry : properties.entrySet()) {
-                if (entry.getKey().equals(semanticField)) {
-                    continue;
-                }
-                if (entry.getValue() instanceof Map) {
-                    Map<String, Object> fieldDef = (Map<String, Object>) entry.getValue();
-                    if ("semantic".equals(fieldDef.get("type"))) {
-                        String existingOriginal = (String) fieldDef.get("original_field");
-                        if (originalField.equals(existingOriginal)) {
-                            sendError(
-                                channel,
-                                RestStatus.BAD_REQUEST,
-                                "original_field [" + originalField + "] is already enriched by semantic field [" + entry.getKey() + "]"
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Check semantic_field doesn't already exist as non-semantic
-            Object existingSemantic = properties.get(semanticField);
-            if (existingSemantic instanceof Map) {
-                String existingType = (String) ((Map<String, Object>) existingSemantic).get("type");
-                if (existingType != null && !"semantic".equals(existingType)) {
-                    sendError(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "semantic_field [" + semanticField + "] already exists with type [" + existingType + "]"
-                    );
-                    return;
-                }
-            }
-
-            // Build mapping fragment
-            if (!first) mappingBuilder.append(",");
-            // Explicitly set status=ENABLED so that calling enable on a previously DISABLED field
-            // re-enables it (the mapper preserves existing status when the incoming value is null).
-            mappingBuilder.append(
+        for (String[] v : validated) {
+            if (!first) mb.append(",");
+            mb.append(
                 String.format(
                     Locale.ROOT,
                     "\"%s\":{\"type\":\"semantic\",\"original_field\":\"%s\",\"language\":\"%s\",\"model_type\":\"%s\",\"status\":\"ENABLED\"}",
-                    semanticField,
-                    originalField,
-                    language.toUpperCase(Locale.ROOT),
-                    modelType.toUpperCase(Locale.ROOT)
+                    v[1],
+                    v[0],
+                    v[2].toUpperCase(Locale.ROOT),
+                    v[3].toUpperCase(Locale.ROOT)
                 )
             );
             first = false;
-            validatedFields.add(new String[] { originalField, semanticField, language, modelType });
         }
-        mappingBuilder.append("}}");
+        mb.append("}}");
 
-        // Execute PutMapping for all fields at once
-        PutMappingRequest putMappingRequest = new PutMappingRequest(index);
-        putMappingRequest.source(mappingBuilder.toString(), XContentType.JSON);
-
-        client.admin().indices().putMapping(putMappingRequest, new ActionListener<AcknowledgedResponse>() {
-            @Override
-            public void onResponse(AcknowledgedResponse response) {
-                if (!response.isAcknowledged()) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping was not acknowledged");
-                    return;
-                }
-                // After mapping is created, create the search pipeline with semantic_search_rewrite_processor
-                createSearchPipelineForEnrichment(index, validatedFields, client, channel);
+        PutMappingRequest pmr = new PutMappingRequest(index);
+        pmr.source(mb.toString(), XContentType.JSON);
+        client.admin().indices().putMapping(pmr, ActionListener.wrap(resp -> {
+            if (!resp.isAcknowledged()) {
+                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping not acknowledged");
+                return;
             }
+            createEnrichingIngestPipeline(index, validated, client, channel);
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping failed: " + e.getMessage())));
+    }
 
-            @Override
-            public void onFailure(Exception e) {
-                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create semantic fields: " + e.getMessage());
-            }
-        });
+    private void createEnrichingIngestPipeline(String index, List<String[]> validated, NodeClient client, RestChannel channel) {
+        String pipeName = index + INGEST_PIPELINE_SUFFIX;
+        String body = buildIngestPipelineBody(index, validated, false);
+        PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(body), XContentType.JSON);
+        client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
+            createSearchPipelineAndAttach(index, validated, client, channel, pipeName);
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Ingest pipeline failed: " + e.getMessage())));
     }
 
     @SuppressWarnings("unchecked")
-    private void createSearchPipelineForEnrichment(String index, List<String[]> validatedFields, NodeClient client, RestChannel channel) {
-        // Read updated mapping to get model_ids
+    private void createSearchPipelineAndAttach(
+        String index,
+        List<String[]> validated,
+        NodeClient client,
+        RestChannel channel,
+        String ingestPipeName
+    ) {
         IndexMetadata updated = clusterService.state().metadata().index(index);
-        Map<String, Object> updatedProps = null;
-        if (updated != null && updated.mapping() != null) {
-            updatedProps = (Map<String, Object>) updated.mapping().sourceAsMap().get("properties");
-        }
+        Map<String, Object> props = updated != null && updated.mapping() != null
+            ? (Map<String, Object>) updated.mapping().sourceAsMap().get("properties")
+            : Map.of();
 
-        // Build field_map with SEMANTIC field name as key (not source field)
-        StringJoiner rewriteFieldMapEntries = new StringJoiner(",");
-        for (String[] vf : validatedFields) {
-            String semanticField = vf[1];
-            String modelId = "unknown";
-            String modelType = vf[3];
-            if (updatedProps != null && updatedProps.get(semanticField) instanceof Map) {
-                Object mid = ((Map<String, Object>) updatedProps.get(semanticField)).get("model_id");
-                if (mid != null) modelId = mid.toString();
+        StringJoiner fmEntries = new StringJoiner(",");
+        for (String[] v : validated) {
+            String mid = "unknown";
+            if (props.get(v[1]) instanceof Map m) {
+                Object o = m.get("model_id");
+                if (o != null) mid = o.toString();
             }
-            String targetField = semanticField + "_semantic_info.embedding";
-            String type = "SPARSE".equalsIgnoreCase(modelType) ? "sparse" : "dense";
-            String analyzer = "SPARSE".equalsIgnoreCase(modelType) ? ",\"analyzer\":\"bert-uncased\"" : "";
-            rewriteFieldMapEntries.add(
+            String target = v[1] + "_semantic_info.embedding";
+            String type = "SPARSE".equalsIgnoreCase(v[3]) ? "sparse" : "dense";
+            String analyzer = "SPARSE".equalsIgnoreCase(v[3]) ? ",\"analyzer\":\"bert-uncased\"" : "";
+            fmEntries.add(
                 String.format(
                     Locale.ROOT,
                     "\"%s\":{\"type\":\"%s\",\"target_field\":\"%s\",\"model_id\":\"%s\"%s}",
-                    semanticField,
+                    v[1],
                     type,
-                    targetField,
-                    modelId,
+                    target,
+                    mid,
                     analyzer
                 )
             );
         }
 
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        String pipelineBody = String.format(
+        String searchPipeName = index + SEARCH_PIPELINE_SUFFIX;
+        String searchBody = String.format(
             Locale.ROOT,
-            "{\"request_processors\":[{\"semantic_search_rewrite_processor\":{\"field_map\":{%s}}}"
-                + ",{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
-            rewriteFieldMapEntries.toString()
+            "{\"request_processors\":[{\"semantic_search_rewrite_processor\":{\"field_map\":{%s}}},{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
+            fmEntries
         );
 
-        PutSearchPipelineRequest pipelineRequest = new PutSearchPipelineRequest(
-            pipelineName,
-            new BytesArray(pipelineBody),
-            XContentType.JSON
-        );
-
-        final Map<String, Object> finalUpdatedProps = updatedProps;
-        client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, pipelineRequest, new ActionListener<AcknowledgedResponse>() {
-            @Override
-            public void onResponse(AcknowledgedResponse response) {
-                if (!response.isAcknowledged()) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create search pipeline");
-                    return;
-                }
-                // Set as default search pipeline
-                org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest settingsRequest =
-                    new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
-                settingsRequest.settings(
-                    org.opensearch.common.settings.Settings.builder().put("index.search.default_pipeline", pipelineName).build()
-                );
-                client.admin().indices().updateSettings(settingsRequest, new ActionListener<AcknowledgedResponse>() {
-                    @Override
-                    public void onResponse(AcknowledgedResponse settingsResp) {
-                        StringBuilder respBuilder = new StringBuilder(
-                            "{\"acknowledged\":true,\"index\":\"" + index + "\",\"pipeline\":\"" + pipelineName + "\",\"fields\":["
-                        );
-                        boolean respFirst = true;
-                        for (String[] vf : validatedFields) {
-                            if (!respFirst) respBuilder.append(",");
-                            String modelId = "unknown";
-                            if (finalUpdatedProps != null && finalUpdatedProps.get(vf[1]) instanceof Map) {
-                                Object mid = ((Map<String, Object>) finalUpdatedProps.get(vf[1])).get("model_id");
-                                if (mid != null) modelId = mid.toString();
-                            }
-                            respBuilder.append(
-                                String.format(
-                                    Locale.ROOT,
-                                    "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"model_id\":\"%s\",\"status\":\"ENABLED\"}",
-                                    vf[0],
-                                    vf[1],
-                                    modelId
-                                )
-                            );
-                            respFirst = false;
-                        }
-                        respBuilder.append("]}");
-                        try {
-                            channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-                        } catch (Exception e) {
-                            log.error("Failed to send response", e);
-                        }
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        sendError(
-                            channel,
-                            RestStatus.INTERNAL_SERVER_ERROR,
-                            "Pipeline created but failed to set as default: " + e.getMessage()
-                        );
-                    }
-                });
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to create search pipeline: " + e.getMessage());
-            }
-        });
-    }
-
-    // ========================= disable_semantic_enrichment =========================
-
-    @SuppressWarnings("unchecked")
-    private void handleDisableEnrichment(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
-        List<Map<String, Object>> fields = extractFields(body);
-        if (fields == null || fields.isEmpty()) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Request must contain 'fields' array or original_field/semantic_field params");
-            return;
-        }
-
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
-        if (indexMetadata == null) {
-            sendError(channel, RestStatus.NOT_FOUND, "Index [" + index + "] does not exist");
-            return;
-        }
-
-        List<String[]> fieldPairs = new ArrayList<>();
-        for (Map<String, Object> fieldSpec : fields) {
-            String originalField = (String) fieldSpec.get("original_field");
-            String semanticField = (String) fieldSpec.get("semantic_field");
-            if (originalField == null || semanticField == null) {
-                sendError(channel, RestStatus.BAD_REQUEST, "original_field and semantic_field are required");
-                return;
-            }
-            fieldPairs.add(new String[] { originalField, semanticField });
-        }
-
-        // First: remove FieldReplacementProcessor from pipeline (in case currently DEPLOYED)
-        removeFieldReplacementProcessor(index, client, channel, () -> {
-            // Then: set status=DISABLED via PutMapping (full cleanup from any state)
-            StringBuilder mappingBuilder = new StringBuilder("{\"properties\":{");
-            boolean first = true;
-            for (String[] fp : fieldPairs) {
-                if (!first) mappingBuilder.append(",");
-                mappingBuilder.append(String.format(Locale.ROOT, "\"%s\":{\"type\":\"semantic\",\"status\":\"DISABLED\"}", fp[1]));
-                first = false;
-            }
-            mappingBuilder.append("}}");
-
-            PutMappingRequest putMappingRequest = new PutMappingRequest(index);
-            putMappingRequest.source(mappingBuilder.toString(), XContentType.JSON);
-
-            client.admin().indices().putMapping(putMappingRequest, new ActionListener<AcknowledgedResponse>() {
-                @Override
-                public void onResponse(AcknowledgedResponse response) {
-                    StringBuilder respBuilder = new StringBuilder("{\"acknowledged\":true,\"index\":\"" + index + "\",\"fields\":[");
-                    boolean respFirst = true;
-                    for (String[] fp : fieldPairs) {
-                        if (!respFirst) respBuilder.append(",");
-                        respBuilder.append(
-                            String.format(
-                                Locale.ROOT,
-                                "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"status\":\"DISABLED\"}",
-                                fp[0],
-                                fp[1]
-                            )
-                        );
-                        respFirst = false;
-                    }
-                    respBuilder.append("]}");
-                    try {
-                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-                    } catch (Exception e) {
-                        log.error("Failed to send response", e);
-                    }
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to disable enrichment: " + e.getMessage());
-                }
-            });
-        });
-    }
-
-    // ========================= deploy_semantic_enrichment =========================
-
-    @SuppressWarnings("unchecked")
-    private void handleDeploy(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
-        List<Map<String, Object>> fields = extractFields(body);
-        if (fields == null || fields.isEmpty()) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Request must contain 'fields' array or original_field/semantic_field params");
-            return;
-        }
-
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
-        if (indexMetadata == null) {
-            sendError(channel, RestStatus.NOT_FOUND, "Index [" + index + "] does not exist");
-            return;
-        }
-
-        Map<String, Object> properties = (Map<String, Object>) indexMetadata.mapping().sourceAsMap().get("properties");
-        if (properties == null) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Index [" + index + "] has no properties");
-            return;
-        }
-
-        // Validate all semantic fields exist and are ENABLED
-        List<String[]> fieldPairs = new ArrayList<>();
-        for (Map<String, Object> fieldSpec : fields) {
-            String originalField = (String) fieldSpec.get("original_field");
-            String semanticField = (String) fieldSpec.get("semantic_field");
-            if (originalField == null || semanticField == null) {
-                sendError(channel, RestStatus.BAD_REQUEST, "original_field and semantic_field are required");
-                return;
-            }
-
-            if (!(properties.get(semanticField) instanceof Map)) {
-                sendError(channel, RestStatus.BAD_REQUEST, "semantic_field [" + semanticField + "] does not exist");
-                return;
-            }
-            Map<String, Object> semDef = (Map<String, Object>) properties.get(semanticField);
-            if (!"semantic".equals(semDef.get("type"))) {
-                sendError(channel, RestStatus.BAD_REQUEST, "[" + semanticField + "] is not a semantic field");
-                return;
-            }
-            String modelId = (String) semDef.get("model_id");
-            if (modelId == null) {
-                sendError(channel, RestStatus.BAD_REQUEST, "semantic_field [" + semanticField + "] has no model_id");
-                return;
-            }
-            // Deploy only allowed from ENRICHING state (status=ENABLED, not DISABLED)
-            String status = (String) semDef.getOrDefault("status", "ENABLED");
-            if ("DISABLED".equalsIgnoreCase(status)) {
-                sendError(
+        PutSearchPipelineRequest spr = new PutSearchPipelineRequest(searchPipeName, new BytesArray(searchBody), XContentType.JSON);
+        client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, spr, ActionListener.wrap(resp -> {
+            // Attach both pipelines
+            var sr = new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
+            sr.settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put("index.default_pipeline", ingestPipeName)
+                    .put("index.search.default_pipeline", searchPipeName)
+                    .build()
+            );
+            client.admin().indices().updateSettings(sr, ActionListener.wrap(settResp -> {
+                sendResponse(
                     channel,
-                    RestStatus.BAD_REQUEST,
-                    "Cannot deploy semantic_field [" + semanticField + "] — field is DISABLED. Call enable_semantic_enrichment first."
-                );
-                return;
-            }
-            fieldPairs.add(new String[] { originalField, semanticField });
-        }
-
-        // Deploy is purely a search-pipeline change: add the FieldReplacementProcessor so that
-        // queries on the original field are rewritten to the semantic field (then to neural).
-        // The DEPLOYED vs ENRICHING distinction lives entirely in the pipeline — no mapping change.
-        // Reject if already DEPLOYED (FieldReplacementProcessor already present).
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        GetSearchPipelineRequest getPipelineRequest = new GetSearchPipelineRequest(pipelineName);
-        client.admin()
-            .cluster()
-            .execute(GetSearchPipelineAction.INSTANCE, getPipelineRequest, new ActionListener<GetSearchPipelineResponse>() {
-                @Override
-                public void onResponse(GetSearchPipelineResponse pipelineResponse) {
-                    if (checkFieldReplacementInPipeline(pipelineResponse)) {
-                        sendError(channel, RestStatus.BAD_REQUEST, "Index [" + index + "] is already DEPLOYED.");
-                        return;
-                    }
-                    addFieldReplacementProcessor(index, fieldPairs, client, channel, () -> sendDeployResponse(channel, index, fieldPairs));
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    // Pipeline missing — enable was not run
-                    sendError(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "Search pipeline [" + pipelineName + "] does not exist. Run enable_semantic_enrichment first."
-                    );
-                }
-            });
-    }
-
-    private void sendDeployResponse(RestChannel channel, String index, List<String[]> fieldPairs) {
-        StringBuilder respBuilder = new StringBuilder(
-            "{\"acknowledged\":true,\"index\":\"" + index + "\",\"state\":\"DEPLOYED\",\"fields\":["
-        );
-        boolean respFirst = true;
-        for (String[] fp : fieldPairs) {
-            if (!respFirst) respBuilder.append(",");
-            respBuilder.append(
-                String.format(
-                    Locale.ROOT,
-                    "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"field_replacement\":\"active\"}",
-                    fp[0],
-                    fp[1]
-                )
-            );
-            respFirst = false;
-        }
-        respBuilder.append("]}");
-        try {
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-        } catch (Exception e) {
-            log.error("Failed to send response", e);
-        }
-    }
-
-    // ========================= rollback_semantic_enrichment =========================
-
-    @SuppressWarnings("unchecked")
-    private void handleRollback(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
-        List<Map<String, Object>> fields = extractFields(body);
-        if (fields == null || fields.isEmpty()) {
-            sendError(channel, RestStatus.BAD_REQUEST, "Request must contain 'fields' array or original_field/semantic_field params");
-            return;
-        }
-
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
-        if (indexMetadata == null) {
-            sendError(channel, RestStatus.NOT_FOUND, "Index [" + index + "] does not exist");
-            return;
-        }
-
-        List<String[]> fieldPairs = new ArrayList<>();
-        for (Map<String, Object> fieldSpec : fields) {
-            String originalField = (String) fieldSpec.get("original_field");
-            String semanticField = (String) fieldSpec.get("semantic_field");
-            if (originalField == null || semanticField == null) {
-                sendError(channel, RestStatus.BAD_REQUEST, "original_field and semantic_field are required");
-                return;
-            }
-            fieldPairs.add(new String[] { originalField, semanticField });
-        }
-
-        // Rollback is purely a search-pipeline change: remove the FieldReplacementProcessor so that
-        // queries on the original field return to plain BM25. Embeddings keep generating (copy mode).
-        // No mapping change is needed.
-        removeFieldReplacementProcessor(index, client, channel, () -> {
-            StringBuilder respBuilder = new StringBuilder(
-                "{\"acknowledged\":true,\"index\":\"" + index + "\",\"state\":\"ENRICHING\",\"fields\":["
-            );
-            boolean respFirst = true;
-            for (String[] fp : fieldPairs) {
-                if (!respFirst) respBuilder.append(",");
-                respBuilder.append(
+                    RestStatus.OK,
                     String.format(
                         Locale.ROOT,
-                        "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"field_replacement\":\"removed\"}",
-                        fp[0],
-                        fp[1]
+                        "{\"acknowledged\":true,\"index\":\"%s\",\"ingest_pipeline\":\"%s\",\"search_pipeline\":\"%s\",\"state\":\"ENRICHING\"}",
+                        index,
+                        ingestPipeName,
+                        searchPipeName
                     )
                 );
-                respFirst = false;
-            }
-            respBuilder.append("]}");
-            try {
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-            } catch (Exception e) {
-                log.error("Failed to send response", e);
-            }
+            }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Settings failed: " + e.getMessage())));
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Search pipeline failed: " + e.getMessage())));
+    }
+
+    // ========================= deploy =========================
+
+    private void handleDeploy(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
+        List<String[]> fp = extractFieldPairs(body, channel);
+        if (fp == null) return;
+        String pipeName = index + INGEST_PIPELINE_SUFFIX;
+        String pipeBody = buildIngestPipelineBody(index, fp, true);
+        PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(pipeBody), XContentType.JSON);
+        client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
+            addFieldReplacementProcessor(
+                index,
+                fp,
+                client,
+                channel,
+                () -> sendResponse(channel, RestStatus.OK, "{\"acknowledged\":true,\"index\":\"" + index + "\",\"state\":\"DEPLOYED\"}")
+            );
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Deploy failed: " + e.getMessage())));
+    }
+
+    // ========================= rollback =========================
+
+    private void handleRollback(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
+        List<String[]> fp = extractFieldPairs(body, channel);
+        if (fp == null) return;
+        String pipeName = index + INGEST_PIPELINE_SUFFIX;
+        String pipeBody = buildIngestPipelineBody(index, fp, false);
+        PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(pipeBody), XContentType.JSON);
+        client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
+            removeFieldReplacementProcessor(
+                index,
+                client,
+                channel,
+                () -> sendResponse(channel, RestStatus.OK, "{\"acknowledged\":true,\"index\":\"" + index + "\",\"state\":\"ENRICHING\"}")
+            );
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Rollback failed: " + e.getMessage())));
+    }
+
+    // ========================= disable =========================
+
+    private void handleDisable(String index, Map<String, Object> body, NodeClient client, RestChannel channel) {
+        List<String[]> fp = extractFieldPairs(body, channel);
+        if (fp == null) return;
+        removeFieldReplacementProcessor(index, client, channel, () -> {
+            // Empty the ingest pipeline
+            String pipeName = index + INGEST_PIPELINE_SUFFIX;
+            String emptyBody = "{\"description\":\"ASE (DISABLED)\",\"processors\":[]}";
+            PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(emptyBody), XContentType.JSON);
+            client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
+                // Set status=DISABLED
+                StringBuilder mb = new StringBuilder("{\"properties\":{");
+                boolean mf = true;
+                for (String[] f : fp) {
+                    if (!mf) mb.append(",");
+                    mb.append(String.format(Locale.ROOT, "\"%s\":{\"type\":\"semantic\",\"status\":\"DISABLED\"}", f[1]));
+                    mf = false;
+                }
+                mb.append("}}");
+                PutMappingRequest pmr = new PutMappingRequest(index);
+                pmr.source(mb.toString(), XContentType.JSON);
+                client.admin()
+                    .indices()
+                    .putMapping(
+                        pmr,
+                        ActionListener.wrap(
+                            mr -> sendResponse(
+                                channel,
+                                RestStatus.OK,
+                                "{\"acknowledged\":true,\"index\":\"" + index + "\",\"state\":\"DISABLED\"}"
+                            ),
+                            e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Disable mapping failed: " + e.getMessage())
+                        )
+                    );
+            }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Disable pipeline failed: " + e.getMessage())));
         });
     }
 
-    // ========================= list_semantic_enrichment =========================
+    // ========================= list =========================
 
     @SuppressWarnings("unchecked")
     private void handleList(String index, NodeClient client, RestChannel channel) {
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(index);
-        if (indexMetadata == null) {
-            sendError(channel, RestStatus.NOT_FOUND, "Index [" + index + "] does not exist");
+        IndexMetadata im = clusterService.state().metadata().index(index);
+        if (im == null) {
+            sendError(channel, RestStatus.NOT_FOUND, "Index not found");
             return;
         }
+        Map<String, Object> props = im.mapping() != null ? (Map<String, Object>) im.mapping().sourceAsMap().get("properties") : Map.of();
 
-        Map<String, Object> properties = (Map<String, Object>) indexMetadata.mapping().sourceAsMap().get("properties");
-        if (properties == null) {
-            try {
-                channel.sendResponse(
-                    new BytesRestResponse(RestStatus.OK, "application/json", "{\"index\":\"" + index + "\",\"fields\":[]}")
-                );
-            } catch (Exception e) {
-                log.error("Failed to send response", e);
+        String pipeName = index + INGEST_PIPELINE_SUFFIX;
+        client.admin().cluster().getPipeline(new GetPipelineRequest(pipeName), new ActionListener<GetPipelineResponse>() {
+            public void onResponse(GetPipelineResponse r) {
+                buildListResponse(channel, index, props, hasRename(r, pipeName));
             }
-            return;
-        }
 
-        // GET the search pipeline to check if field_replacement_processor is present
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        GetSearchPipelineRequest getPipelineRequest = new GetSearchPipelineRequest(pipelineName);
-
-        client.admin()
-            .cluster()
-            .execute(GetSearchPipelineAction.INSTANCE, getPipelineRequest, new ActionListener<GetSearchPipelineResponse>() {
-                @Override
-                public void onResponse(GetSearchPipelineResponse pipelineResponse) {
-                    boolean hasFieldReplacement = checkFieldReplacementInPipeline(pipelineResponse);
-                    sendListResponse(channel, index, properties, hasFieldReplacement);
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    // Pipeline might not exist — that's fine, just means no field_replacement
-                    sendListResponse(channel, index, properties, false);
-                }
-            });
+            public void onFailure(Exception e) {
+                buildListResponse(channel, index, props, false);
+            }
+        });
     }
 
     @SuppressWarnings("unchecked")
-    private boolean checkFieldReplacementInPipeline(GetSearchPipelineResponse pipelineResponse) {
-        if (pipelineResponse == null || pipelineResponse.pipelines() == null || pipelineResponse.pipelines().isEmpty()) {
-            return false;
-        }
-        for (PipelineConfiguration config : pipelineResponse.pipelines()) {
-            Map<String, Object> configMap = config.getConfigAsMap();
-            Object requestProcessors = configMap.get("request_processors");
-            if (requestProcessors instanceof List<?> processors) {
-                for (Object proc : processors) {
-                    if (proc instanceof Map<?, ?> procMap) {
-                        if (procMap.containsKey(FIELD_REPLACEMENT_PROCESSOR_TYPE)) {
-                            return true;
-                        }
+    private boolean hasRename(GetPipelineResponse r, String name) {
+        if (r == null || r.pipelines() == null) return false;
+        for (var c : r.pipelines()) {
+            if (name.equals(c.getId())) {
+                Object procs = c.getConfigAsMap().get("processors");
+                if (procs instanceof List<?> l) {
+                    for (Object p : l) {
+                        if (p instanceof Map<?, ?> m && m.containsKey("rename")) return true;
                     }
                 }
             }
@@ -710,225 +368,151 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
     }
 
     @SuppressWarnings("unchecked")
-    private void sendListResponse(RestChannel channel, String index, Map<String, Object> properties, boolean hasFieldReplacement) {
-        StringBuilder respBuilder = new StringBuilder("{\"index\":\"" + index + "\",\"fields\":[");
+    private void buildListResponse(RestChannel channel, String index, Map<String, Object> props, boolean hasRename) {
+        StringBuilder sb = new StringBuilder("{\"index\":\"" + index + "\",\"fields\":[");
         boolean first = true;
-
-        for (Map.Entry<String, Object> entry : properties.entrySet()) {
-            if (!(entry.getValue() instanceof Map)) continue;
-            Map<String, Object> fieldDef = (Map<String, Object>) entry.getValue();
-            if (!"semantic".equals(fieldDef.get("type"))) continue;
-
-            String originalField = (String) fieldDef.get("original_field");
-            if (originalField == null) continue;
-
-            String semanticField = entry.getKey();
-            String modelId = (String) fieldDef.getOrDefault("model_id", "");
-            String modelType = (String) fieldDef.getOrDefault("model_type", "SPARSE");
-            String language = (String) fieldDef.getOrDefault("language", "ENGLISH");
-            String status = (String) fieldDef.getOrDefault("status", "ENABLED");
-
-            // Derive state from status + pipeline (no stored _rename flag):
-            // DISABLED — status is DISABLED
-            // DEPLOYED — FieldReplacementProcessor present (queries on original field rewritten)
-            // ENRICHING — otherwise (embeddings generated, queries on original field still BM25)
-            String state;
-            if ("DISABLED".equalsIgnoreCase(status)) {
-                state = "DISABLED";
-            } else if (hasFieldReplacement) {
-                state = "DEPLOYED";
-            } else {
-                state = "ENRICHING";
-            }
-
-            if (!first) respBuilder.append(",");
-            respBuilder.append(
-                String.format(
-                    Locale.ROOT,
-                    "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"model_id\":\"%s\",\"model_type\":\"%s\",\"language\":\"%s\",\"status\":\"%s\",\"state\":\"%s\"}",
-                    originalField,
-                    semanticField,
-                    modelId,
-                    modelType,
-                    language,
-                    status,
-                    state
-                )
+        for (var e : props.entrySet()) {
+            if (!(e.getValue() instanceof Map)) continue;
+            Map<String, Object> fd = (Map<String, Object>) e.getValue();
+            if (!"semantic".equals(fd.get("type"))) continue;
+            String of = (String) fd.get("original_field");
+            if (of == null) continue;
+            String status = (String) fd.getOrDefault("status", "ENABLED");
+            String state = "DISABLED".equalsIgnoreCase(status) ? "DISABLED" : (hasRename ? "DEPLOYED" : "ENRICHING");
+            if (!first) sb.append(",");
+            sb.append(
+                String.format(Locale.ROOT, "{\"original_field\":\"%s\",\"semantic_field\":\"%s\",\"state\":\"%s\"}", of, e.getKey(), state)
             );
             first = false;
         }
-        respBuilder.append("]}");
+        sb.append("]}");
+        sendResponse(channel, RestStatus.OK, sb.toString());
+    }
 
-        try {
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, "application/json", respBuilder.toString()));
-        } catch (Exception e) {
-            log.error("Failed to send response", e);
+    // ========================= Pipeline builders =========================
+
+    private String buildIngestPipelineBody(String index, List<String[]> fieldPairs, boolean deployMode) {
+        StringBuilder procs = new StringBuilder("[");
+        boolean first = true;
+        for (String[] fp : fieldPairs) {
+            if (!first) procs.append(",");
+            if (deployMode) {
+                // rename: moves original_field → semantic_field
+                procs.append(String.format(Locale.ROOT, "{\"rename\":{\"field\":\"%s\",\"target_field\":\"%s\"}}", fp[0], fp[1]));
+            } else {
+                // set with mustache template: copies original_field → semantic_field (preserves original)
+                procs.append(String.format(Locale.ROOT, "{\"set\":{\"field\":\"%s\",\"value\":\"{{%s}}\"}}", fp[1], fp[0]));
+            }
+            first = false;
         }
+        procs.append("]");
+        String desc = deployMode ? "ASE ingest (DEPLOYED)" : "ASE ingest (ENRICHING)";
+        return String.format(Locale.ROOT, "{\"description\":\"%s for %s\",\"processors\":%s}", desc, index, procs);
     }
 
-    // ========================= Shared pipeline helpers =========================
+    private List<String[]> extractFieldPairs(Map<String, Object> body, RestChannel channel) {
+        List<Map<String, Object>> fields = extractFields(body);
+        if (fields == null || fields.isEmpty()) {
+            sendError(channel, RestStatus.BAD_REQUEST, "fields required");
+            return null;
+        }
+        List<String[]> pairs = new ArrayList<>();
+        for (Map<String, Object> f : fields) {
+            String o = (String) f.get("original_field");
+            String s = (String) f.get("semantic_field");
+            if (o == null || s == null) {
+                sendError(channel, RestStatus.BAD_REQUEST, "original_field and semantic_field required");
+                return null;
+            }
+            pairs.add(new String[] { o, s });
+        }
+        return pairs;
+    }
 
-    /**
-     * GET existing pipeline, prepend field_replacement_processor with field_map entries, PUT updated pipeline.
-     */
+    // ========================= Search pipeline helpers =========================
+
     @SuppressWarnings("unchecked")
-    private void addFieldReplacementProcessor(
-        String index,
-        List<String[]> fieldPairs,
-        NodeClient client,
-        RestChannel channel,
-        Runnable onSuccess
-    ) {
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        GetSearchPipelineRequest getRequest = new GetSearchPipelineRequest(pipelineName);
-
-        client.admin().cluster().execute(GetSearchPipelineAction.INSTANCE, getRequest, new ActionListener<GetSearchPipelineResponse>() {
-            @Override
-            public void onResponse(GetSearchPipelineResponse getResponse) {
-                if (getResponse.pipelines() == null || getResponse.pipelines().isEmpty()) {
-                    sendError(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "Search pipeline [" + pipelineName + "] does not exist. Run enable_semantic_enrichment first."
-                    );
-                    return;
-                }
-
-                PipelineConfiguration pipelineConfig = getResponse.pipelines().get(0);
-                Map<String, Object> configMap = new LinkedHashMap<>(pipelineConfig.getConfigAsMap());
-
-                // Build field_map for field_replacement_processor: {original_field: semantic_field}
-                Map<String, Object> fieldMap = new LinkedHashMap<>();
-                for (String[] fp : fieldPairs) {
-                    fieldMap.put(fp[0], fp[1]);
-                }
-
-                // Build the field_replacement_processor entry
-                Map<String, Object> fieldReplacementConfig = new LinkedHashMap<>();
-                fieldReplacementConfig.put("field_map", fieldMap);
-                Map<String, Object> processorEntry = new LinkedHashMap<>();
-                processorEntry.put(FIELD_REPLACEMENT_PROCESSOR_TYPE, fieldReplacementConfig);
-
-                // Get existing request_processors list
-                List<Map<String, Object>> requestProcessors;
-                Object existing = configMap.get("request_processors");
-                if (existing instanceof List<?>) {
-                    requestProcessors = new ArrayList<>((List<Map<String, Object>>) existing);
-                } else {
-                    requestProcessors = new ArrayList<>();
-                }
-
-                // Remove existing field_replacement_processor if present (replace it)
-                requestProcessors.removeIf(p -> p.containsKey(FIELD_REPLACEMENT_PROCESSOR_TYPE));
-
-                // Prepend field_replacement_processor
-                requestProcessors.add(0, processorEntry);
-                configMap.put("request_processors", requestProcessors);
-
-                // PUT updated pipeline
-                putPipeline(pipelineName, configMap, client, channel, onSuccess);
+    private void addFieldReplacementProcessor(String index, List<String[]> fp, NodeClient client, RestChannel channel, Runnable onSuccess) {
+        String name = index + SEARCH_PIPELINE_SUFFIX;
+        client.admin().cluster().execute(GetSearchPipelineAction.INSTANCE, new GetSearchPipelineRequest(name), ActionListener.wrap(gr -> {
+            if (gr.pipelines() == null || gr.pipelines().isEmpty()) {
+                sendError(channel, RestStatus.BAD_REQUEST, "Search pipeline missing");
+                return;
             }
-
-            @Override
-            public void onFailure(Exception e) {
-                sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to get search pipeline: " + e.getMessage());
-            }
-        });
+            Map<String, Object> cfg = new LinkedHashMap<>(gr.pipelines().get(0).getConfigAsMap());
+            Map<String, Object> fm = new LinkedHashMap<>();
+            for (String[] f : fp)
+                fm.put(f[0], f[1]);
+            Map<String, Object> frc = Map.of("field_map", fm);
+            List<Map<String, Object>> rp = cfg.get("request_processors") instanceof List<?> l
+                ? new ArrayList<>((List<Map<String, Object>>) l)
+                : new ArrayList<>();
+            rp.removeIf(p -> p.containsKey(FIELD_REPLACEMENT_PROCESSOR_TYPE));
+            rp.add(0, Map.of(FIELD_REPLACEMENT_PROCESSOR_TYPE, frc));
+            cfg.put("request_processors", rp);
+            putSearchPipeline(name, cfg, client, channel, onSuccess);
+        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Get search pipeline failed: " + e.getMessage())));
     }
 
-    /**
-     * GET existing pipeline, remove field_replacement_processor, PUT updated pipeline.
-     */
     @SuppressWarnings("unchecked")
     private void removeFieldReplacementProcessor(String index, NodeClient client, RestChannel channel, Runnable onSuccess) {
-        String pipelineName = index + SEARCH_PIPELINE_SUFFIX;
-        GetSearchPipelineRequest getRequest = new GetSearchPipelineRequest(pipelineName);
-
-        client.admin().cluster().execute(GetSearchPipelineAction.INSTANCE, getRequest, new ActionListener<GetSearchPipelineResponse>() {
-            @Override
-            public void onResponse(GetSearchPipelineResponse getResponse) {
-                if (getResponse.pipelines() == null || getResponse.pipelines().isEmpty()) {
-                    // Pipeline doesn't exist — nothing to remove, treat as success
-                    onSuccess.run();
-                    return;
-                }
-
-                PipelineConfiguration pipelineConfig = getResponse.pipelines().get(0);
-                Map<String, Object> configMap = new LinkedHashMap<>(pipelineConfig.getConfigAsMap());
-
-                // Get existing request_processors list
-                Object existing = configMap.get("request_processors");
-                if (existing instanceof List<?>) {
-                    List<Map<String, Object>> requestProcessors = new ArrayList<>((List<Map<String, Object>>) existing);
-                    // Remove field_replacement_processor
-                    requestProcessors.removeIf(p -> p.containsKey(FIELD_REPLACEMENT_PROCESSOR_TYPE));
-                    configMap.put("request_processors", requestProcessors);
-                }
-
-                // PUT updated pipeline (without field_replacement_processor)
-                putPipeline(pipelineName, configMap, client, channel, onSuccess);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                // Pipeline doesn't exist — nothing to remove
+        String name = index + SEARCH_PIPELINE_SUFFIX;
+        client.admin().cluster().execute(GetSearchPipelineAction.INSTANCE, new GetSearchPipelineRequest(name), ActionListener.wrap(gr -> {
+            if (gr.pipelines() == null || gr.pipelines().isEmpty()) {
                 onSuccess.run();
+                return;
             }
-        });
+            Map<String, Object> cfg = new LinkedHashMap<>(gr.pipelines().get(0).getConfigAsMap());
+            if (cfg.get("request_processors") instanceof List<?> l) {
+                List<Map<String, Object>> rp = new ArrayList<>((List<Map<String, Object>>) l);
+                rp.removeIf(p -> p.containsKey(FIELD_REPLACEMENT_PROCESSOR_TYPE));
+                cfg.put("request_processors", rp);
+            }
+            putSearchPipeline(name, cfg, client, channel, onSuccess);
+        }, e -> onSuccess.run()));
     }
 
-    /**
-     * PUT a search pipeline with the given config map.
-     */
-    private void putPipeline(
-        String pipelineName,
-        Map<String, Object> configMap,
-        NodeClient client,
-        RestChannel channel,
-        Runnable onSuccess
-    ) {
+    private void putSearchPipeline(String name, Map<String, Object> cfg, NodeClient client, RestChannel channel, Runnable onSuccess) {
         try {
-            org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.core.xcontent.XContentBuilder.builder(
-                XContentType.JSON.xContent()
-            );
-            builder.map(configMap);
-            org.opensearch.core.common.bytes.BytesReference pipelineBytes = org.opensearch.core.common.bytes.BytesReference.bytes(builder);
-
-            PutSearchPipelineRequest putRequest = new PutSearchPipelineRequest(pipelineName, pipelineBytes, XContentType.JSON);
-
-            client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, putRequest, new ActionListener<AcknowledgedResponse>() {
-                @Override
-                public void onResponse(AcknowledgedResponse response) {
-                    if (response.isAcknowledged()) {
-                        onSuccess.run();
-                    } else {
-                        sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Pipeline update not acknowledged");
-                    }
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to update search pipeline: " + e.getMessage());
-                }
-            });
+            var builder = org.opensearch.core.xcontent.XContentBuilder.builder(XContentType.JSON.xContent());
+            builder.map(cfg);
+            var bytes = org.opensearch.core.common.bytes.BytesReference.bytes(builder);
+            client.admin()
+                .cluster()
+                .execute(
+                    PutSearchPipelineAction.INSTANCE,
+                    new PutSearchPipelineRequest(name, bytes, XContentType.JSON),
+                    ActionListener.wrap(r -> {
+                        if (r.isAcknowledged()) onSuccess.run();
+                        else sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Not acknowledged");
+                    }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Search pipeline update failed: " + e.getMessage()))
+                );
         } catch (Exception e) {
-            sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Failed to serialize pipeline config: " + e.getMessage());
+            sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Serialize failed: " + e.getMessage());
         }
     }
 
-    // ========================= Error helper =========================
+    // ========================= Error/Response helpers =========================
 
-    private void sendError(RestChannel channel, RestStatus status, String message) {
-        String errorBody = String.format(
-            Locale.ROOT,
-            "{\"error\":{\"type\":\"illegal_argument_exception\",\"reason\":\"%s\"},\"status\":%d}",
-            message,
-            status.getStatus()
-        );
+    private void sendError(RestChannel ch, RestStatus st, String msg) {
         try {
-            channel.sendResponse(new BytesRestResponse(status, "application/json", errorBody));
+            ch.sendResponse(
+                new BytesRestResponse(
+                    st,
+                    "application/json",
+                    String.format(Locale.ROOT, "{\"error\":{\"reason\":\"%s\"},\"status\":%d}", msg, st.getStatus())
+                )
+            );
         } catch (Exception e) {
-            log.error("Failed to send error response", e);
+            log.error("Send error failed", e);
+        }
+    }
+
+    private void sendResponse(RestChannel ch, RestStatus st, String body) {
+        try {
+            ch.sendResponse(new BytesRestResponse(st, "application/json", body));
+        } catch (Exception e) {
+            log.error("Send response failed", e);
         }
     }
 }

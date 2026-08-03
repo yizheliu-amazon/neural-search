@@ -417,50 +417,9 @@ public class SemanticFieldProcessor extends AbstractBatchingSystemProcessor {
         for (Map.Entry<String, Map<String, Object>> entry : pathToFieldConfig.entrySet()) {
             final String path = entry.getKey();
             final Map<String, Object> config = entry.getValue();
+            // Always read from the semantic field directly (data routing is handled by the ingest pipeline)
+            collectSemanticFieldInfo(doc, path.split("\\."), config, 0, "", semanticFieldInfos, docId);
 
-            final Object textSourcePathObj = config.get("_text_source_path");
-
-            if (textSourcePathObj != null) {
-                // Reject if doc contains the semantic field directly when original_field is configured
-                if (doc instanceof Map<?, ?> docMap && docMap.containsKey(path)) {
-                    throw new IllegalArgumentException(
-                        "Field ["
-                            + path
-                            + "] has original_field ["
-                            + textSourcePathObj
-                            + "] configured. "
-                            + "Ingest data into ["
-                            + textSourcePathObj
-                            + "] instead of ["
-                            + path
-                            + "]."
-                    );
-                }
-                // original_field configured: read text from original field, use semantic field path for companion
-                final String textSourcePath = textSourcePathObj.toString();
-                Object textValue = null;
-                if (doc instanceof Map<?, ?> docMap) {
-                    textValue = docMap.get(textSourcePath);
-                }
-                if (textValue instanceof String) {
-                    final SemanticFieldInfo semanticFieldInfo = SemanticFieldInfo.builder()
-                        .value(textValue.toString())
-                        .modelId(getModelId(config, path))
-                        .semanticFieldFullPathInMapping(path)
-                        .semanticFieldFullPathInDoc(path)
-                        .semanticInfoFullPathInDoc(getSemanticInfoFieldFullPath(config, path, path))
-                        .chunkingEnabled(isChunkingEnabled(config, path))
-                        .sparseEncodingConfig(new SparseEncodingConfig(config))
-                        .skipExistingEmbedding(isSkipExistingEmbeddingEnabled(config, path))
-                        .docId(docId)
-                        .build();
-                    semanticFieldInfo.setChunkingConfig(new ChunkingConfig(config), analysisRegistry);
-                    semanticFieldInfos.add(semanticFieldInfo);
-                }
-            } else {
-                // Normal path: read from the semantic field itself
-                collectSemanticFieldInfo(doc, path.split("\\."), config, 0, "", semanticFieldInfos, docId);
-            }
         }
         return semanticFieldInfos;
     }
