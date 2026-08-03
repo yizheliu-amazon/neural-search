@@ -191,41 +191,18 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         RestChannel channel,
         String ingestPipeName
     ) {
-        IndexMetadata updated = clusterService.state().metadata().index(index);
-        Map<String, Object> props = updated != null && updated.mapping() != null
-            ? (Map<String, Object>) updated.mapping().sourceAsMap().get("properties")
-            : Map.of();
-
-        StringJoiner fmEntries = new StringJoiner(",");
+        // Build simple fields list for match_to_neural_rewrite_processor
+        StringJoiner fieldsList = new StringJoiner(",");
         for (String[] v : validated) {
-            String mid = "unknown";
-            if (props.get(v[1]) instanceof Map m) {
-                Object o = m.get("model_id");
-                if (o != null) mid = o.toString();
-            }
-            String target = v[1] + "_semantic_info.embedding";
-            String type = "SPARSE".equalsIgnoreCase(v[3]) ? "sparse" : "dense";
-            String analyzer = "SPARSE".equalsIgnoreCase(v[3]) ? ",\"analyzer\":\"bert-uncased\"" : "";
-            fmEntries.add(
-                String.format(
-                    Locale.ROOT,
-                    "\"%s\":{\"type\":\"%s\",\"target_field\":\"%s\",\"model_id\":\"%s\"%s}",
-                    v[1],
-                    type,
-                    target,
-                    mid,
-                    analyzer
-                )
-            );
+            fieldsList.add("\"" + v[1] + "\"");
         }
 
         String searchPipeName = index + SEARCH_PIPELINE_SUFFIX;
         String searchBody = String.format(
             Locale.ROOT,
-            "{\"request_processors\":[{\"semantic_search_rewrite_processor\":{\"field_map\":{%s}}},{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
-            fmEntries
+            "{\"request_processors\":[{\"match_to_neural_rewrite_processor\":{\"fields\":[%s]}},{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
+            fieldsList
         );
-
         PutSearchPipelineRequest spr = new PutSearchPipelineRequest(searchPipeName, new BytesArray(searchBody), XContentType.JSON);
         client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, spr, ActionListener.wrap(resp -> {
             // Attach both pipelines

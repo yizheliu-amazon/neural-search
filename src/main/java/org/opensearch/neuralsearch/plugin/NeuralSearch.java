@@ -144,6 +144,7 @@ import org.opensearch.neuralsearch.transport.NeuralSparseWarmupTransportAction;
 
 import org.opensearch.neuralsearch.action.SemanticSearchPipelineActionFilter;
 import org.opensearch.neuralsearch.processor.FieldReplacementProcessor;
+import org.opensearch.neuralsearch.processor.MatchToNeuralRewriteProcessor;
 import org.opensearch.neuralsearch.processor.SemanticSearchRewriteProcessor;
 import org.opensearch.neuralsearch.util.NeuralSearchClusterUtil;
 import org.opensearch.neuralsearch.util.PipelineServiceUtil;
@@ -420,7 +421,9 @@ public class NeuralSearch extends Plugin
             SemanticSearchRewriteProcessor.TYPE,
             new SemanticSearchRewriteProcessor.Factory(),
             FieldReplacementProcessor.TYPE,
-            new FieldReplacementProcessor.Factory()
+            new FieldReplacementProcessor.Factory(),
+            MatchToNeuralRewriteProcessor.TYPE,
+            new MatchToNeuralRewriteProcessor.Factory()
         );
     }
 
