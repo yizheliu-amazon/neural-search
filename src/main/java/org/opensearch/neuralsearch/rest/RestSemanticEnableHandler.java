@@ -12,9 +12,11 @@ import org.opensearch.action.search.GetSearchPipelineAction;
 import org.opensearch.action.search.GetSearchPipelineRequest;
 import org.opensearch.action.search.PutSearchPipelineAction;
 import org.opensearch.action.search.PutSearchPipelineRequest;
+import org.opensearch.action.ingest.GetPipelineAction;
 import org.opensearch.action.ingest.GetPipelineRequest;
 import org.opensearch.action.ingest.GetPipelineResponse;
 import org.opensearch.action.ingest.PutPipelineRequest;
+import org.opensearch.neuralsearch.util.PipelineMergeUtil;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
@@ -34,8 +36,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.HashSet;
 import java.util.Set;
-import java.util.StringJoiner;
 
 /**
  * REST handler for semantic enrichment lifecycle APIs.
@@ -144,7 +146,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             validated.add(new String[] { orig, sem, lang, mtype });
         }
 
-        // PutMapping: create semantic field
+        // Build mapping source
         StringBuilder mb = new StringBuilder("{\"properties\":{");
         boolean first = true;
         for (String[] v : validated) {
@@ -162,71 +164,441 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             first = false;
         }
         mb.append("}}");
+        final String mappingSource = mb.toString();
 
+        // Pre-check: validate that both ingest and search pipeline merges will succeed
+        // BEFORE the irreversible PutMapping. Collect source fields for ingest validation.
+        Set<String> sourceFields = new HashSet<>();
+        for (String[] v : validated) {
+            sourceFields.add(v[0]);
+        }
+
+        String existingIngestPipeline = indexMetadata.getSettings().get("index.default_pipeline");
+        String existingSearchPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
+
+        preCheckPipelinesAndProceed(
+            index,
+            mappingSource,
+            validated,
+            sourceFields,
+            existingIngestPipeline,
+            existingSearchPipeline,
+            client,
+            channel
+        );
+    }
+
+    /**
+     * Pre-check both ingest and search pipelines for merge conflicts before the irreversible PutMapping.
+     * If both pass, proceed with PutMapping and then merge/create pipelines.
+     */
+    @SuppressWarnings("unchecked")
+    private void preCheckPipelinesAndProceed(
+        String index,
+        String mappingSource,
+        List<String[]> validated,
+        Set<String> sourceFields,
+        String existingIngestPipeline,
+        String existingSearchPipeline,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        // Step 1: Check ingest pipeline conflicts (if one exists)
+        if (existingIngestPipeline != null && !"_none".equals(existingIngestPipeline)) {
+            client.admin()
+                .cluster()
+                .execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(existingIngestPipeline), ActionListener.wrap(ingestResp -> {
+                    if (ingestResp.isFound() && ingestResp.pipelines() != null && !ingestResp.pipelines().isEmpty()) {
+                        Map<String, Object> pipelineConfig = ingestResp.pipelines().get(0).getConfigAsMap();
+                        List<Map<String, Object>> processors = (List<Map<String, Object>>) pipelineConfig.get("processors");
+                        if (processors != null) {
+                            List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipelineConfig, sourceFields);
+                            if (!conflicts.isEmpty()) {
+                                sendError(
+                                    channel,
+                                    RestStatus.CONFLICT,
+                                    "Cannot enable ASE: existing ingest pipeline ["
+                                        + existingIngestPipeline
+                                        + "] has conflicts: "
+                                        + String.join("; ", conflicts)
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    // Ingest check passed — now check search pipeline
+                    preCheckSearchPipelineAndProceed(
+                        index,
+                        mappingSource,
+                        validated,
+                        sourceFields,
+                        existingIngestPipeline,
+                        existingSearchPipeline,
+                        client,
+                        channel
+                    );
+                }, e -> {
+                    // Pipeline fetch failed — proceed (pipeline might not exist despite setting)
+                    preCheckSearchPipelineAndProceed(
+                        index,
+                        mappingSource,
+                        validated,
+                        sourceFields,
+                        existingIngestPipeline,
+                        existingSearchPipeline,
+                        client,
+                        channel
+                    );
+                }));
+        } else {
+            // No existing ingest pipeline — skip check, go to search check
+            preCheckSearchPipelineAndProceed(
+                index,
+                mappingSource,
+                validated,
+                sourceFields,
+                existingIngestPipeline,
+                existingSearchPipeline,
+                client,
+                channel
+            );
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void preCheckSearchPipelineAndProceed(
+        String index,
+        String mappingSource,
+        List<String[]> validated,
+        Set<String> sourceFields,
+        String existingIngestPipeline,
+        String existingSearchPipeline,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        if (existingSearchPipeline != null && !"_none".equals(existingSearchPipeline)) {
+            client.admin()
+                .cluster()
+                .execute(
+                    GetSearchPipelineAction.INSTANCE,
+                    new GetSearchPipelineRequest(existingSearchPipeline),
+                    ActionListener.wrap(searchResp -> {
+                        if (searchResp.pipelines() != null && !searchResp.pipelines().isEmpty()) {
+                            Map<String, Object> existingConfig = searchResp.pipelines().get(0).getConfigAsMap();
+                            List<String> conflicts = PipelineMergeUtil.checkSearchPipelineConflicts(existingConfig);
+                            if (!conflicts.isEmpty()) {
+                                sendError(
+                                    channel,
+                                    RestStatus.CONFLICT,
+                                    "Cannot enable ASE: existing search pipeline ["
+                                        + existingSearchPipeline
+                                        + "] has conflicts: "
+                                        + String.join("; ", conflicts)
+                                );
+                                return;
+                            }
+                        }
+                        // All pre-checks passed — proceed with PutMapping
+                        proceedWithPutMapping(
+                            index,
+                            mappingSource,
+                            validated,
+                            existingIngestPipeline,
+                            existingSearchPipeline,
+                            client,
+                            channel
+                        );
+                    }, e -> {
+                        // Search pipeline fetch failed — proceed
+                        proceedWithPutMapping(
+                            index,
+                            mappingSource,
+                            validated,
+                            existingIngestPipeline,
+                            existingSearchPipeline,
+                            client,
+                            channel
+                        );
+                    })
+                );
+        } else {
+            // No existing search pipeline — proceed directly
+            proceedWithPutMapping(index, mappingSource, validated, existingIngestPipeline, existingSearchPipeline, client, channel);
+        }
+    }
+
+    /**
+     * Execute the irreversible PutMapping, then create/merge pipelines.
+     */
+    private void proceedWithPutMapping(
+        String index,
+        String mappingSource,
+        List<String[]> validated,
+        String existingIngestPipeline,
+        String existingSearchPipeline,
+        NodeClient client,
+        RestChannel channel
+    ) {
         PutMappingRequest pmr = new PutMappingRequest(index);
-        pmr.source(mb.toString(), XContentType.JSON);
+        pmr.source(mappingSource, XContentType.JSON);
         client.admin().indices().putMapping(pmr, ActionListener.wrap(resp -> {
             if (!resp.isAcknowledged()) {
                 sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping not acknowledged");
                 return;
             }
-            createEnrichingIngestPipeline(index, validated, client, channel);
-        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "PutMapping failed: " + e.getMessage())));
+            // PutMapping committed. Now create/merge pipelines.
+            mergeOrCreateIngestPipeline(index, validated, existingIngestPipeline, existingSearchPipeline, client, channel);
+        }, e -> sendError(channel, RestStatus.BAD_REQUEST, "PutMapping failed: " + e.getMessage())));
     }
 
-    private void createEnrichingIngestPipeline(String index, List<String[]> validated, NodeClient client, RestChannel channel) {
+    /**
+     * Merge ASE ingest processors into an existing pipeline, or create a new one.
+     * If an existing ingest pipeline is set, append ASE's set/rename processors to the end.
+     * Otherwise, create a fresh ASE-owned pipeline and set it as default.
+     */
+    @SuppressWarnings("unchecked")
+    private void mergeOrCreateIngestPipeline(
+        String index,
+        List<String[]> validated,
+        String existingIngestPipeline,
+        String existingSearchPipeline,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        // Build ASE ingest processors to append
+        List<Map<String, Object>> aseIngestProcessors = buildAseIngestProcessors(validated, false);
+
+        if (existingIngestPipeline != null && !"_none".equals(existingIngestPipeline)) {
+            // Merge into existing pipeline
+            client.admin()
+                .cluster()
+                .execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(existingIngestPipeline), ActionListener.wrap(resp -> {
+                    String targetPipeName = existingIngestPipeline;
+                    if (resp.isFound() && resp.pipelines() != null && !resp.pipelines().isEmpty()) {
+                        Map<String, Object> existing = resp.pipelines().get(0).getConfigAsMap();
+                        List<Map<String, Object>> processors = existing.get("processors") instanceof List<?> l
+                            ? new ArrayList<>((List<Map<String, Object>>) l)
+                            : new ArrayList<>();
+                        // Remove any existing ASE-managed processors before appending fresh ones
+                        processors.removeIf(p -> isAseManaged(p));
+                        processors.addAll(aseIngestProcessors);
+                        Map<String, Object> merged = new LinkedHashMap<>(existing);
+                        merged.put("processors", processors);
+                        putIngestPipelineConfig(
+                            targetPipeName,
+                            merged,
+                            client,
+                            channel,
+                            () -> mergeOrCreateSearchPipeline(index, validated, existingSearchPipeline, targetPipeName, client, channel)
+                        );
+                    } else {
+                        // Pipeline doesn't actually exist despite setting — create fresh
+                        createFreshIngestPipeline(index, validated, existingSearchPipeline, client, channel);
+                    }
+                }, e -> createFreshIngestPipeline(index, validated, existingSearchPipeline, client, channel)));
+        } else {
+            // No existing ingest pipeline — create fresh
+            createFreshIngestPipeline(index, validated, existingSearchPipeline, client, channel);
+        }
+    }
+
+    private void createFreshIngestPipeline(
+        String index,
+        List<String[]> validated,
+        String existingSearchPipeline,
+        NodeClient client,
+        RestChannel channel
+    ) {
         String pipeName = index + INGEST_PIPELINE_SUFFIX;
         String body = buildIngestPipelineBody(index, validated, false);
         PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(body), XContentType.JSON);
         client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
-            createSearchPipelineAndAttach(index, validated, client, channel, pipeName);
+            // Set as default, then handle search pipeline
+            var sr = new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
+            sr.settings(org.opensearch.common.settings.Settings.builder().put("index.default_pipeline", pipeName).build());
+            client.admin().indices().updateSettings(sr, ActionListener.wrap(settResp -> {
+                mergeOrCreateSearchPipeline(index, validated, existingSearchPipeline, pipeName, client, channel);
+            }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Settings failed: " + e.getMessage())));
         }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Ingest pipeline failed: " + e.getMessage())));
     }
 
+    /**
+     * Merge ASE search processors into an existing pipeline, or create a new one.
+     * If an existing search pipeline is set, prepend ASE's processors to the beginning.
+     * Otherwise, create a fresh ASE-owned pipeline and set it as default.
+     */
     @SuppressWarnings("unchecked")
-    private void createSearchPipelineAndAttach(
+    private void mergeOrCreateSearchPipeline(
         String index,
         List<String[]> validated,
+        String existingSearchPipeline,
+        String ingestPipeName,
         NodeClient client,
-        RestChannel channel,
-        String ingestPipeName
+        RestChannel channel
     ) {
-        // Build simple fields list for match_to_neural_rewrite_processor
-        StringJoiner fieldsList = new StringJoiner(",");
-        for (String[] v : validated) {
-            fieldsList.add("\"" + v[1] + "\"");
-        }
+        List<Map<String, Object>> aseSearchProcessors = buildAseSearchProcessors(validated);
 
+        if (existingSearchPipeline != null && !"_none".equals(existingSearchPipeline)) {
+            // Merge into existing search pipeline
+            client.admin()
+                .cluster()
+                .execute(
+                    GetSearchPipelineAction.INSTANCE,
+                    new GetSearchPipelineRequest(existingSearchPipeline),
+                    ActionListener.wrap(resp -> {
+                        if (resp.pipelines() != null && !resp.pipelines().isEmpty()) {
+                            Map<String, Object> existingConfig = resp.pipelines().get(0).getConfigAsMap();
+                            Map<String, Object> merged = PipelineMergeUtil.buildMergedSearchPipeline(existingConfig, aseSearchProcessors);
+                            putSearchPipeline(
+                                existingSearchPipeline,
+                                merged,
+                                client,
+                                channel,
+                                () -> sendEnableResponse(channel, index, ingestPipeName, existingSearchPipeline)
+                            );
+                        } else {
+                            createFreshSearchPipeline(index, validated, ingestPipeName, client, channel);
+                        }
+                    }, e -> createFreshSearchPipeline(index, validated, ingestPipeName, client, channel))
+                );
+        } else {
+            createFreshSearchPipeline(index, validated, ingestPipeName, client, channel);
+        }
+    }
+
+    private void createFreshSearchPipeline(
+        String index,
+        List<String[]> validated,
+        String ingestPipeName,
+        NodeClient client,
+        RestChannel channel
+    ) {
+        List<Map<String, Object>> aseSearchProcessors = buildAseSearchProcessors(validated);
         String searchPipeName = index + SEARCH_PIPELINE_SUFFIX;
-        String searchBody = String.format(
-            Locale.ROOT,
-            "{\"request_processors\":[{\"match_to_neural_rewrite_processor\":{\"fields\":[%s]}},{\"neural_sparse_two_phase_processor\":{\"enabled\":true}}]}",
-            fieldsList
-        );
-        PutSearchPipelineRequest spr = new PutSearchPipelineRequest(searchPipeName, new BytesArray(searchBody), XContentType.JSON);
-        client.admin().cluster().execute(PutSearchPipelineAction.INSTANCE, spr, ActionListener.wrap(resp -> {
-            // Attach both pipelines
+
+        Map<String, Object> freshConfig = new LinkedHashMap<>();
+        freshConfig.put("request_processors", aseSearchProcessors);
+        putSearchPipeline(searchPipeName, freshConfig, client, channel, () -> {
+            // Set as default search pipeline
             var sr = new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
-            sr.settings(
-                org.opensearch.common.settings.Settings.builder()
-                    .put("index.default_pipeline", ingestPipeName)
-                    .put("index.search.default_pipeline", searchPipeName)
-                    .build()
-            );
-            client.admin().indices().updateSettings(sr, ActionListener.wrap(settResp -> {
-                sendResponse(
-                    channel,
-                    RestStatus.OK,
-                    String.format(
-                        Locale.ROOT,
-                        "{\"acknowledged\":true,\"index\":\"%s\",\"ingest_pipeline\":\"%s\",\"search_pipeline\":\"%s\",\"state\":\"ENRICHING\"}",
-                        index,
-                        ingestPipeName,
-                        searchPipeName
+            sr.settings(org.opensearch.common.settings.Settings.builder().put("index.search.default_pipeline", searchPipeName).build());
+            client.admin()
+                .indices()
+                .updateSettings(
+                    sr,
+                    ActionListener.wrap(
+                        settResp -> sendEnableResponse(channel, index, ingestPipeName, searchPipeName),
+                        e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Settings failed: " + e.getMessage())
                     )
                 );
-            }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Settings failed: " + e.getMessage())));
-        }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Search pipeline failed: " + e.getMessage())));
+        });
+    }
+
+    private void sendEnableResponse(RestChannel channel, String index, String ingestPipeName, String searchPipeName) {
+        sendResponse(
+            channel,
+            RestStatus.OK,
+            String.format(
+                Locale.ROOT,
+                "{\"acknowledged\":true,\"index\":\"%s\",\"ingest_pipeline\":\"%s\",\"search_pipeline\":\"%s\",\"state\":\"ENRICHING\"}",
+                index,
+                ingestPipeName,
+                searchPipeName
+            )
+        );
+    }
+
+    // ========================= ASE processor builders =========================
+
+    /**
+     * Build the list of ASE ingest processors (set or rename), tagged as ASE-managed.
+     */
+    private List<Map<String, Object>> buildAseIngestProcessors(List<String[]> fieldPairs, boolean deployMode) {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        for (String[] fp : fieldPairs) {
+            Map<String, Object> procConfig = new LinkedHashMap<>();
+            procConfig.put(PipelineMergeUtil.TAG_KEY, PipelineMergeUtil.ASE_MANAGED_TAG);
+            Map<String, Object> proc = new LinkedHashMap<>();
+            if (deployMode) {
+                procConfig.put("field", fp[0]);
+                procConfig.put("target_field", fp[1]);
+                proc.put("rename", procConfig);
+            } else {
+                procConfig.put("field", fp[1]);
+                procConfig.put("value", "{{" + fp[0] + "}}");
+                proc.put("set", procConfig);
+            }
+            processors.add(proc);
+        }
+        return processors;
+    }
+
+    /**
+     * Build the list of ASE search request processors, tagged as ASE-managed.
+     */
+    private List<Map<String, Object>> buildAseSearchProcessors(List<String[]> validated) {
+        // match_to_neural_rewrite_processor
+        List<String> fieldNames = new ArrayList<>();
+        for (String[] v : validated) {
+            fieldNames.add(v[1]); // semantic_field name
+        }
+        Map<String, Object> rewriteConfig = new LinkedHashMap<>();
+        rewriteConfig.put(PipelineMergeUtil.TAG_KEY, PipelineMergeUtil.ASE_MANAGED_TAG);
+        rewriteConfig.put("fields", fieldNames);
+        Map<String, Object> rewriteProc = new LinkedHashMap<>();
+        rewriteProc.put(PipelineMergeUtil.MATCH_TO_NEURAL_REWRITE_PROCESSOR, rewriteConfig);
+
+        // neural_sparse_two_phase_processor
+        Map<String, Object> twoPhaseConfig = new LinkedHashMap<>();
+        twoPhaseConfig.put(PipelineMergeUtil.TAG_KEY, PipelineMergeUtil.ASE_MANAGED_TAG);
+        twoPhaseConfig.put("enabled", true);
+        Map<String, Object> twoPhaseProc = new LinkedHashMap<>();
+        twoPhaseProc.put(PipelineMergeUtil.NEURAL_SPARSE_TWO_PHASE_PROCESSOR, twoPhaseConfig);
+
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(rewriteProc);
+        processors.add(twoPhaseProc);
+        return processors;
+    }
+
+    /**
+     * Check if a processor wrapper is ASE-managed (has tag=ase_managed).
+     */
+    private boolean isAseManaged(Map<String, Object> processorWrapper) {
+        for (Object val : processorWrapper.values()) {
+            if (val instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> config = (Map<String, Object>) val;
+                if (PipelineMergeUtil.ASE_MANAGED_TAG.equals(config.get(PipelineMergeUtil.TAG_KEY))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * PUT an ingest pipeline given a config map.
+     */
+    private void putIngestPipelineConfig(
+        String pipelineName,
+        Map<String, Object> configMap,
+        NodeClient client,
+        RestChannel channel,
+        Runnable onSuccess
+    ) {
+        try {
+            var builder = org.opensearch.core.xcontent.XContentBuilder.builder(XContentType.JSON.xContent());
+            builder.map(configMap);
+            var bytes = org.opensearch.core.common.bytes.BytesReference.bytes(builder);
+            PutPipelineRequest req = new PutPipelineRequest(pipelineName, bytes, XContentType.JSON);
+            client.admin().cluster().putPipeline(req, ActionListener.wrap(r -> {
+                if (r.isAcknowledged()) onSuccess.run();
+                else sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Ingest pipeline not acknowledged");
+            }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Ingest pipeline update failed: " + e.getMessage())));
+        } catch (Exception e) {
+            sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Serialize failed: " + e.getMessage());
+        }
     }
 
     // ========================= deploy =========================

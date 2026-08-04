@@ -139,47 +139,21 @@ public class SemanticSearchPipelineActionFilter implements ActionFilter {
     }
 
     /**
-     * Check if the PutMapping request adds semantic fields to an index that already has a
-     * non-ASE search pipeline attached. If so, throw to reject the request.
+     * Previously: hard-blocked PutMapping if a non-ASE search pipeline existed on the index.
+     * Now: no-op. Conflict detection and pipeline merging is handled by RestSemanticEnableHandler
+     * via PipelineMergeUtil BEFORE calling PutMapping. Retained to preserve call structure.
      */
     private <Request extends ActionRequest> void checkSearchPipelineConflict(Request request) {
-        if (!(request instanceof org.opensearch.action.admin.indices.mapping.put.PutMappingRequest putRequest)) {
-            return;
-        }
-
-        // Check if the incoming mapping contains semantic fields
-        String mappingSource = putRequest.source();
-        if (mappingSource == null || !mappingSource.contains("\"semantic\"")) {
-            return; // No semantic field in this PutMapping — no conflict possible
-        }
-
-        for (String indexName : putRequest.indices()) {
-            IndexMetadata indexMetadata = clusterService.state().metadata().index(indexName);
-            if (indexMetadata == null) continue;
-
-            String currentPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
-            if (currentPipeline != null && !currentPipeline.endsWith(SEARCH_PIPELINE_SUFFIX)) {
-                throw new IllegalArgumentException(
-                    "Search pipeline ["
-                        + currentPipeline
-                        + "] is already enabled for index ["
-                        + indexName
-                        + "]. "
-                        + "Please remove it before adding semantic fields. "
-                        + "Use: PUT /"
-                        + indexName
-                        + "/_settings {\"index.search.default_pipeline\": null}"
-                );
-            }
-        }
+        // No-op: conflict detection moved to RestSemanticEnableHandler pre-check phase.
     }
 
+    /**
+     * Previously: auto-created/updated search pipeline after PutMapping added semantic fields.
+     * Now: no-op. Pipeline creation/merging is handled by RestSemanticEnableHandler.
+     * Retained to preserve call structure.
+     */
     private <Request extends ActionRequest> void handlePutMappingResponse(Request request) {
-        if (request instanceof org.opensearch.action.admin.indices.mapping.put.PutMappingRequest putRequest) {
-            for (String indexName : putRequest.indices()) {
-                handleIndexWithSemanticFields(indexName);
-            }
-        }
+        // No-op: pipeline management moved to RestSemanticEnableHandler.
     }
 
     private void handleIndexWithSemanticFields(String indexName) {
