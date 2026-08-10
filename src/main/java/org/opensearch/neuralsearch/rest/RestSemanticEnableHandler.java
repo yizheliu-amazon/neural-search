@@ -173,96 +173,108 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
             sourceFields.add(v[0]);
         }
 
-        String existingIngestPipeline = indexMetadata.getSettings().get("index.default_pipeline");
+        // ASE installs its routing processors in the FINAL pipeline, not the default pipeline:
+        // - final_pipeline cannot be bypassed by a request-level ?pipeline= parameter
+        // - final_pipeline still runs BEFORE the system ingest pipeline that generates embeddings
+        // See SemanticFieldUpdateSemanticsIT for the tests establishing both properties.
+        //
+        // We must still conflict-check the DEFAULT pipeline even though we never modify it, because
+        // it runs first and could remove or rename the source field out from under us.
+        String existingDefaultPipeline = indexMetadata.getSettings().get("index.default_pipeline");
+        String existingFinalPipeline = indexMetadata.getSettings().get("index.final_pipeline");
         String existingSearchPipeline = indexMetadata.getSettings().get("index.search.default_pipeline");
 
-        preCheckPipelinesAndProceed(
+        List<String> ingestPipelinesToCheck = new ArrayList<>();
+        if (isRealPipeline(existingDefaultPipeline)) {
+            ingestPipelinesToCheck.add(existingDefaultPipeline);
+        }
+        if (isRealPipeline(existingFinalPipeline)) {
+            ingestPipelinesToCheck.add(existingFinalPipeline);
+        }
+
+        preCheckIngestPipelines(
             index,
             mappingSource,
             validated,
             sourceFields,
-            existingIngestPipeline,
+            ingestPipelinesToCheck,
+            0,
+            existingFinalPipeline,
             existingSearchPipeline,
             client,
             channel
         );
     }
 
+    /** True when a pipeline setting names an actual pipeline (not absent, not the _none sentinel). */
+    private boolean isRealPipeline(String pipelineName) {
+        return pipelineName != null && !"_none".equals(pipelineName);
+    }
+
     /**
-     * Pre-check both ingest and search pipelines for merge conflicts before the irreversible PutMapping.
-     * If both pass, proceed with PutMapping and then merge/create pipelines.
+     * Sequentially conflict-check each ingest pipeline attached to the index (default and final)
+     * before the irreversible PutMapping. Both are checked; only the final pipeline is later modified.
+     * Once all pass, moves on to the search pipeline check.
      */
     @SuppressWarnings("unchecked")
-    private void preCheckPipelinesAndProceed(
+    private void preCheckIngestPipelines(
         String index,
         String mappingSource,
         List<String[]> validated,
         Set<String> sourceFields,
-        String existingIngestPipeline,
+        List<String> pipelinesToCheck,
+        int position,
+        String existingFinalPipeline,
         String existingSearchPipeline,
         NodeClient client,
         RestChannel channel
     ) {
-        // Step 1: Check ingest pipeline conflicts (if one exists)
-        if (existingIngestPipeline != null && !"_none".equals(existingIngestPipeline)) {
-            client.admin()
-                .cluster()
-                .execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(existingIngestPipeline), ActionListener.wrap(ingestResp -> {
-                    if (ingestResp.isFound() && ingestResp.pipelines() != null && !ingestResp.pipelines().isEmpty()) {
-                        Map<String, Object> pipelineConfig = ingestResp.pipelines().get(0).getConfigAsMap();
-                        List<Map<String, Object>> processors = (List<Map<String, Object>>) pipelineConfig.get("processors");
-                        if (processors != null) {
-                            List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipelineConfig, sourceFields);
-                            if (!conflicts.isEmpty()) {
-                                sendError(
-                                    channel,
-                                    RestStatus.CONFLICT,
-                                    "Cannot enable ASE: existing ingest pipeline ["
-                                        + existingIngestPipeline
-                                        + "] has conflicts: "
-                                        + String.join("; ", conflicts)
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    // Ingest check passed — now check search pipeline
-                    preCheckSearchPipelineAndProceed(
-                        index,
-                        mappingSource,
-                        validated,
-                        sourceFields,
-                        existingIngestPipeline,
-                        existingSearchPipeline,
-                        client,
-                        channel
-                    );
-                }, e -> {
-                    // Pipeline fetch failed — proceed (pipeline might not exist despite setting)
-                    preCheckSearchPipelineAndProceed(
-                        index,
-                        mappingSource,
-                        validated,
-                        sourceFields,
-                        existingIngestPipeline,
-                        existingSearchPipeline,
-                        client,
-                        channel
-                    );
-                }));
-        } else {
-            // No existing ingest pipeline — skip check, go to search check
+        if (position >= pipelinesToCheck.size()) {
             preCheckSearchPipelineAndProceed(
                 index,
                 mappingSource,
                 validated,
                 sourceFields,
-                existingIngestPipeline,
+                existingFinalPipeline,
                 existingSearchPipeline,
                 client,
                 channel
             );
+            return;
         }
+
+        final String pipelineName = pipelinesToCheck.get(position);
+        final Runnable next = () -> preCheckIngestPipelines(
+            index,
+            mappingSource,
+            validated,
+            sourceFields,
+            pipelinesToCheck,
+            position + 1,
+            existingFinalPipeline,
+            existingSearchPipeline,
+            client,
+            channel
+        );
+
+        client.admin().cluster().execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(pipelineName), ActionListener.wrap(resp -> {
+            if (resp.isFound() && resp.pipelines() != null && !resp.pipelines().isEmpty()) {
+                Map<String, Object> pipelineConfig = resp.pipelines().get(0).getConfigAsMap();
+                List<String> conflicts = PipelineMergeUtil.checkIngestPipelineConflicts(pipelineConfig, sourceFields);
+                if (!conflicts.isEmpty()) {
+                    sendError(
+                        channel,
+                        RestStatus.CONFLICT,
+                        "Cannot enable ASE: existing ingest pipeline [" + pipelineName + "] has conflicts: " + String.join("; ", conflicts)
+                    );
+                    return;
+                }
+            }
+            next.run();
+        }, e -> {
+            // GET failing usually means the pipeline does not exist despite the setting — nothing to conflict with.
+            next.run();
+        }));
     }
 
     @SuppressWarnings("unchecked")
@@ -271,7 +283,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         String mappingSource,
         List<String[]> validated,
         Set<String> sourceFields,
-        String existingIngestPipeline,
+        String existingFinalPipeline,
         String existingSearchPipeline,
         NodeClient client,
         RestChannel channel
@@ -303,7 +315,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
                             index,
                             mappingSource,
                             validated,
-                            existingIngestPipeline,
+                            existingFinalPipeline,
                             existingSearchPipeline,
                             client,
                             channel
@@ -314,7 +326,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
                             index,
                             mappingSource,
                             validated,
-                            existingIngestPipeline,
+                            existingFinalPipeline,
                             existingSearchPipeline,
                             client,
                             channel
@@ -323,7 +335,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
                 );
         } else {
             // No existing search pipeline — proceed directly
-            proceedWithPutMapping(index, mappingSource, validated, existingIngestPipeline, existingSearchPipeline, client, channel);
+            proceedWithPutMapping(index, mappingSource, validated, existingFinalPipeline, existingSearchPipeline, client, channel);
         }
     }
 
@@ -334,7 +346,7 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         String index,
         String mappingSource,
         List<String[]> validated,
-        String existingIngestPipeline,
+        String existingFinalPipeline,
         String existingSearchPipeline,
         NodeClient client,
         RestChannel channel
@@ -347,20 +359,21 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
                 return;
             }
             // PutMapping committed. Now create/merge pipelines.
-            mergeOrCreateIngestPipeline(index, validated, existingIngestPipeline, existingSearchPipeline, client, channel);
+            mergeOrCreateIngestPipeline(index, validated, existingFinalPipeline, existingSearchPipeline, client, channel);
         }, e -> sendError(channel, RestStatus.BAD_REQUEST, "PutMapping failed: " + e.getMessage())));
     }
 
     /**
-     * Merge ASE ingest processors into an existing pipeline, or create a new one.
-     * If an existing ingest pipeline is set, append ASE's set/rename processors to the end.
-     * Otherwise, create a fresh ASE-owned pipeline and set it as default.
+     * Merge ASE ingest processors into the index's existing FINAL pipeline, or create one.
+     * If a final pipeline is already set, append ASE's set/rename processors to the end of it.
+     * Otherwise create a fresh ASE-owned pipeline and attach it as index.final_pipeline.
+     * The customer's default_pipeline is never modified.
      */
     @SuppressWarnings("unchecked")
     private void mergeOrCreateIngestPipeline(
         String index,
         List<String[]> validated,
-        String existingIngestPipeline,
+        String existingFinalPipeline,
         String existingSearchPipeline,
         NodeClient client,
         RestChannel channel
@@ -368,12 +381,12 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         // Build ASE ingest processors to append
         List<Map<String, Object>> aseIngestProcessors = buildAseIngestProcessors(validated, false);
 
-        if (existingIngestPipeline != null && !"_none".equals(existingIngestPipeline)) {
+        if (existingFinalPipeline != null && !"_none".equals(existingFinalPipeline)) {
             // Merge into existing pipeline
             client.admin()
                 .cluster()
-                .execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(existingIngestPipeline), ActionListener.wrap(resp -> {
-                    String targetPipeName = existingIngestPipeline;
+                .execute(GetPipelineAction.INSTANCE, new GetPipelineRequest(existingFinalPipeline), ActionListener.wrap(resp -> {
+                    String targetPipeName = existingFinalPipeline;
                     if (resp.isFound() && resp.pipelines() != null && !resp.pipelines().isEmpty()) {
                         Map<String, Object> existing = resp.pipelines().get(0).getConfigAsMap();
                         List<Map<String, Object>> processors = existing.get("processors") instanceof List<?> l
@@ -413,9 +426,9 @@ public class RestSemanticEnableHandler extends BaseRestHandler {
         String body = buildIngestPipelineBody(index, validated, false);
         PutPipelineRequest req = new PutPipelineRequest(pipeName, new BytesArray(body), XContentType.JSON);
         client.admin().cluster().putPipeline(req, ActionListener.wrap(resp -> {
-            // Set as default, then handle search pipeline
+            // Attach as the FINAL pipeline (not default) so it cannot be bypassed by ?pipeline=
             var sr = new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(index);
-            sr.settings(org.opensearch.common.settings.Settings.builder().put("index.default_pipeline", pipeName).build());
+            sr.settings(org.opensearch.common.settings.Settings.builder().put("index.final_pipeline", pipeName).build());
             client.admin().indices().updateSettings(sr, ActionListener.wrap(settResp -> {
                 mergeOrCreateSearchPipeline(index, validated, existingSearchPipeline, pipeName, client, channel);
             }, e -> sendError(channel, RestStatus.INTERNAL_SERVER_ERROR, "Settings failed: " + e.getMessage())));

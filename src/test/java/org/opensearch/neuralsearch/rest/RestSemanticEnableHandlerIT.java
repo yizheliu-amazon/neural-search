@@ -100,7 +100,7 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
 
         // Verify index settings point to ASE pipelines
         Map<String, Object> settings = fetchSettings(INDEX_NAME);
-        assertEquals(ASE_INGEST_PIPELINE, getNestedSetting(settings, "index.default_pipeline"));
+        assertEquals(ASE_INGEST_PIPELINE, getNestedSetting(settings, "index.final_pipeline"));
         assertEquals(ASE_SEARCH_PIPELINE, getNestedSetting(settings, "index.search.default_pipeline"));
     }
 
@@ -109,16 +109,13 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
     // ==========================================================================
 
     @SneakyThrows
-    public void testEnable_existingIngestPipelineOnly_mergesIngestCreatesFreshSearch() {
+    public void testEnable_existingFinalPipelineOnly_mergesIngestCreatesFreshSearch() {
         // Customer has a safe ingest pipeline (lowercase — doesn't conflict)
         putIngestPipelineRaw(
             CUSTOMER_INGEST_PIPELINE,
             "{\"description\":\"Customer pipeline\",\"processors\":[{\"lowercase\":{\"field\":\"title\"}}]}"
         );
-        createIndex(
-            INDEX_NAME,
-            buildMappingWithSettings("title", "text", "\"index.default_pipeline\":\"" + CUSTOMER_INGEST_PIPELINE + "\"")
-        );
+        createIndex(INDEX_NAME, buildMappingWithSettings("title", "text", "\"index.final_pipeline\":\"" + CUSTOMER_INGEST_PIPELINE + "\""));
 
         Response response = enableEnrichment(INDEX_NAME, "title", "title_semantic");
 
@@ -141,13 +138,57 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
         assertEquals(2, searchProcessors.size());
         assertTrue(searchProcessors.get(0).containsKey("match_to_neural_rewrite_processor"));
 
-        // index.default_pipeline should still point to customer's pipeline (unchanged)
+        // index.final_pipeline should still point to customer's pipeline (unchanged)
         Map<String, Object> settings = fetchSettings(INDEX_NAME);
         assertEquals(
-            "Should still reference customer pipeline",
+            "Should still reference customer final pipeline",
+            CUSTOMER_INGEST_PIPELINE,
+            getNestedSetting(settings, "index.final_pipeline")
+        );
+    }
+
+    // ==========================================================================
+    // MOST COMMON CASE: customer has a default_pipeline, no final_pipeline.
+    // ASE must create a fresh final_pipeline and leave the default pipeline ALONE.
+    // ==========================================================================
+
+    @SneakyThrows
+    public void testEnable_existingDefaultPipeline_isConflictCheckedButNeverModified() {
+        putIngestPipelineRaw(
+            CUSTOMER_INGEST_PIPELINE,
+            "{\"description\":\"Customer pipeline\",\"processors\":[{\"lowercase\":{\"field\":\"title\"}}]}"
+        );
+        createIndex(
+            INDEX_NAME,
+            buildMappingWithSettings("title", "text", "\"index.default_pipeline\":\"" + CUSTOMER_INGEST_PIPELINE + "\"")
+        );
+
+        Map<String, Object> defaultPipelineBefore = getIngestPipelineRaw(CUSTOMER_INGEST_PIPELINE);
+
+        Response response = enableEnrichment(INDEX_NAME, "title", "title_semantic");
+        assertEquals(200, response.getStatusLine().getStatusCode());
+
+        // The customer's default pipeline must be byte-for-byte untouched.
+        assertEquals(
+            "ASE must not modify the customer default_pipeline",
+            defaultPipelineBefore,
+            getIngestPipelineRaw(CUSTOMER_INGEST_PIPELINE)
+        );
+
+        // ASE created its own pipeline and attached it as the FINAL pipeline.
+        Map<String, Object> asePipeline = getIngestPipelineRaw(ASE_INGEST_PIPELINE);
+        assertNotNull("ASE should create its own ingest pipeline", asePipeline);
+        List<Map<String, Object>> aseProcessors = getProcessors(asePipeline);
+        assertEquals("ASE pipeline should hold one set processor", 1, aseProcessors.size());
+        assertTrue(aseProcessors.get(0).containsKey("set"));
+
+        Map<String, Object> settings = fetchSettings(INDEX_NAME);
+        assertEquals(
+            "default_pipeline should still be the customer's",
             CUSTOMER_INGEST_PIPELINE,
             getNestedSetting(settings, "index.default_pipeline")
         );
+        assertEquals("final_pipeline should be ASE's", ASE_INGEST_PIPELINE, getNestedSetting(settings, "index.final_pipeline"));
     }
 
     // ==========================================================================
@@ -220,7 +261,7 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
             buildMappingWithSettings(
                 "title",
                 "text",
-                "\"index.default_pipeline\":\""
+                "\"index.final_pipeline\":\""
                     + CUSTOMER_INGEST_PIPELINE
                     + "\","
                     + "\"index.search.default_pipeline\":\""
@@ -385,10 +426,7 @@ public class RestSemanticEnableHandlerIT extends BaseNeuralSearchIT {
             CUSTOMER_INGEST_PIPELINE,
             "{\"processors\":[{\"set\":{\"tag\":\"ase_managed\",\"field\":\"title_semantic\",\"value\":\"{{title}}\"}}]}"
         );
-        createIndex(
-            INDEX_NAME,
-            buildMappingWithSettings("title", "text", "\"index.default_pipeline\":\"" + CUSTOMER_INGEST_PIPELINE + "\"")
-        );
+        createIndex(INDEX_NAME, buildMappingWithSettings("title", "text", "\"index.final_pipeline\":\"" + CUSTOMER_INGEST_PIPELINE + "\""));
 
         ResponseException ex = expectThrows(ResponseException.class, () -> enableEnrichment(INDEX_NAME, "title", "title_semantic"));
 
