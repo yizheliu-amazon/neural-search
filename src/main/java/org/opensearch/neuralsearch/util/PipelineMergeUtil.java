@@ -318,6 +318,147 @@ public class PipelineMergeUtil {
     }
 
     // =========================================================================
+    // DEPLOY / ROLLBACK / DISABLE — PIPELINE SURGERY
+    // =========================================================================
+
+    /**
+     * Remove all ASE-managed processors from a processor list.
+     *
+     * @param processors The processor list (from "processors" or "request_processors" key).
+     * @return A new list with ASE-managed processors removed. May be empty.
+     */
+    public static List<Map<String, Object>> removeAseProcessors(List<Map<String, Object>> processors) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> proc : processors) {
+            if (!isAseManaged(proc)) {
+                result.add(proc);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Swap ASE-managed ingest processors from enrich mode (set/copy) to deploy mode (rename).
+     *
+     * <p>In enrich mode, ASE uses a {@code set} processor to COPY original_field → semantic_field.
+     * In deploy mode, ASE uses a {@code rename} processor to MOVE original_field → semantic_field.
+     *
+     * <p>Non-ASE processors are passed through unchanged.
+     *
+     * @param processors The processor list from the ingest pipeline.
+     * @return A new list with ASE set processors replaced by equivalent rename processors.
+     */
+    public static List<Map<String, Object>> swapToDeployMode(List<Map<String, Object>> processors) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> proc : processors) {
+            if (!isAseManaged(proc)) {
+                result.add(proc);
+                continue;
+            }
+            // Check if this is a "set" processor that needs to become "rename"
+            if (proc.containsKey("set")) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> setConfig = (Map<String, Object>) proc.get("set");
+                // set processor: field=semantic_field, value={{original_field}}
+                // rename processor: field=original_field, target_field=semantic_field
+                String semanticField = (String) setConfig.get(FIELD_KEY);
+                String valueTemplate = (String) setConfig.get("value");
+                String originalField = extractFieldFromMustache(valueTemplate);
+                if (semanticField != null && originalField != null) {
+                    Map<String, Object> renameConfig = new LinkedHashMap<>();
+                    renameConfig.put(TAG_KEY, ASE_MANAGED_TAG);
+                    renameConfig.put(FIELD_KEY, originalField);
+                    renameConfig.put(TARGET_FIELD_KEY, semanticField);
+                    Map<String, Object> renameProc = new LinkedHashMap<>();
+                    renameProc.put(RENAME_PROCESSOR, renameConfig);
+                    result.add(renameProc);
+                } else {
+                    // Can't parse — leave unchanged
+                    result.add(proc);
+                }
+            } else {
+                // Not a set processor (already rename, or other ASE-managed) — pass through
+                result.add(proc);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Swap ASE-managed ingest processors from deploy mode (rename) back to enrich mode (set/copy).
+     *
+     * <p>Reverses what {@link #swapToDeployMode} does.
+     *
+     * @param processors The processor list from the ingest pipeline.
+     * @return A new list with ASE rename processors replaced by equivalent set processors.
+     */
+    public static List<Map<String, Object>> swapToEnrichMode(List<Map<String, Object>> processors) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> proc : processors) {
+            if (!isAseManaged(proc)) {
+                result.add(proc);
+                continue;
+            }
+            // Check if this is a "rename" processor that needs to become "set"
+            if (proc.containsKey(RENAME_PROCESSOR)) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> renameConfig = (Map<String, Object>) proc.get(RENAME_PROCESSOR);
+                // rename processor: field=original_field, target_field=semantic_field
+                // set processor: field=semantic_field, value={{original_field}}
+                String originalField = (String) renameConfig.get(FIELD_KEY);
+                String semanticField = (String) renameConfig.get(TARGET_FIELD_KEY);
+                if (originalField != null && semanticField != null) {
+                    Map<String, Object> setConfig = new LinkedHashMap<>();
+                    setConfig.put(TAG_KEY, ASE_MANAGED_TAG);
+                    setConfig.put(FIELD_KEY, semanticField);
+                    setConfig.put("value", "{{" + originalField + "}}");
+                    Map<String, Object> setProc = new LinkedHashMap<>();
+                    setProc.put("set", setConfig);
+                    result.add(setProc);
+                } else {
+                    result.add(proc);
+                }
+            } else {
+                // Not a rename processor — pass through
+                result.add(proc);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Check whether a processor wrapper has the ASE-managed tag.
+     *
+     * @param processorWrapper A single processor entry (e.g., {"set": {"tag": "ase_managed", ...}}).
+     * @return true if any processor config in this wrapper has tag=ase_managed.
+     */
+    public static boolean isAseManaged(Map<String, Object> processorWrapper) {
+        for (Object val : processorWrapper.values()) {
+            if (val instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> config = (Map<String, Object>) val;
+                if (ASE_MANAGED_TAG.equals(config.get(TAG_KEY))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Extract a field name from a Mustache template like "{{field_name}}".
+     * Returns null if the template doesn't match the expected pattern.
+     */
+    static String extractFieldFromMustache(String template) {
+        if (template == null) return null;
+        String trimmed = template.trim();
+        if (trimmed.startsWith("{{") && trimmed.endsWith("}}")) {
+            return trimmed.substring(2, trimmed.length() - 2).trim();
+        }
+        return null;
+    }
+
+    // =========================================================================
     // CONFLICT SCANNING
     // =========================================================================
 

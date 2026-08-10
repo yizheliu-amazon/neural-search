@@ -660,4 +660,272 @@ public class PipelineMergeUtilTests extends OpenSearchTestCase {
         assertTrue(result.canMerge());
         assertTrue(result.getMergedPipeline().containsKey("phase_results_processors"));
     }
+
+    // =========================================================================
+    // Tests for removeAseProcessors
+    // =========================================================================
+
+    public void testRemoveAseProcessors_removesAllTagged() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("lowercase", Map.of("field", "title")));
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "content_semantic", "value", "{{content}}")));
+        processors.add(proc("uppercase", Map.of("field", "name")));
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "desc", "target_field", "desc_semantic")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.removeAseProcessors(processors);
+
+        assertEquals(2, result.size());
+        assertTrue(result.get(0).containsKey("lowercase"));
+        assertTrue(result.get(1).containsKey("uppercase"));
+    }
+
+    public void testRemoveAseProcessors_emptyListWhenAllAreAse() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "sem", "value", "{{orig}}")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.removeAseProcessors(processors);
+
+        assertTrue(result.isEmpty());
+    }
+
+    public void testRemoveAseProcessors_preservesAllWhenNoneAreAse() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("lowercase", Map.of("field", "title")));
+        processors.add(proc("trim", Map.of("field", "body")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.removeAseProcessors(processors);
+
+        assertEquals(2, result.size());
+    }
+
+    public void testRemoveAseProcessors_emptyInput() {
+        List<Map<String, Object>> result = PipelineMergeUtil.removeAseProcessors(new ArrayList<>());
+        assertTrue(result.isEmpty());
+    }
+
+    public void testRemoveAseProcessors_doesNotModifyOriginalList() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "sem", "value", "{{orig}}")));
+        processors.add(proc("lowercase", Map.of("field", "x")));
+
+        PipelineMergeUtil.removeAseProcessors(processors);
+
+        assertEquals(2, processors.size()); // original unchanged
+    }
+
+    // =========================================================================
+    // Tests for swapToDeployMode
+    // =========================================================================
+
+    public void testSwapToDeployMode_singleSetBecomesRename() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "content_semantic", "value", "{{content}}")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToDeployMode(processors);
+
+        assertEquals(1, result.size());
+        assertTrue(result.get(0).containsKey("rename"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> config = (Map<String, Object>) result.get(0).get("rename");
+        assertEquals(ASE_MANAGED_TAG, config.get(TAG_KEY));
+        assertEquals("content", config.get("field"));
+        assertEquals("content_semantic", config.get("target_field"));
+    }
+
+    public void testSwapToDeployMode_multipleFields() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "title_semantic", "value", "{{title}}")));
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "body_semantic", "value", "{{body}}")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToDeployMode(processors);
+
+        assertEquals(2, result.size());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c1 = (Map<String, Object>) result.get(0).get("rename");
+        assertEquals("title", c1.get("field"));
+        assertEquals("title_semantic", c1.get("target_field"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c2 = (Map<String, Object>) result.get(1).get("rename");
+        assertEquals("body", c2.get("field"));
+        assertEquals("body_semantic", c2.get("target_field"));
+    }
+
+    public void testSwapToDeployMode_preservesNonAseProcessors() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("lowercase", Map.of("field", "title")));
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "sem", "value", "{{orig}}")));
+        processors.add(proc("trim", Map.of("field", "body")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToDeployMode(processors);
+
+        assertEquals(3, result.size());
+        assertTrue(result.get(0).containsKey("lowercase"));
+        assertTrue(result.get(1).containsKey("rename"));
+        assertTrue(result.get(2).containsKey("trim"));
+    }
+
+    public void testSwapToDeployMode_alreadyRenamePassesThrough() {
+        // If already in deploy mode (rename), swapToDeployMode should be a no-op for that processor
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "orig", "target_field", "sem")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToDeployMode(processors);
+
+        assertEquals(1, result.size());
+        assertTrue(result.get(0).containsKey("rename"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> config = (Map<String, Object>) result.get(0).get("rename");
+        assertEquals("orig", config.get("field"));
+        assertEquals("sem", config.get("target_field"));
+    }
+
+    public void testSwapToDeployMode_emptyInput() {
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToDeployMode(new ArrayList<>());
+        assertTrue(result.isEmpty());
+    }
+
+    // =========================================================================
+    // Tests for swapToEnrichMode
+    // =========================================================================
+
+    public void testSwapToEnrichMode_singleRenameBecomesSet() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "content", "target_field", "content_semantic")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToEnrichMode(processors);
+
+        assertEquals(1, result.size());
+        assertTrue(result.get(0).containsKey("set"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> config = (Map<String, Object>) result.get(0).get("set");
+        assertEquals(ASE_MANAGED_TAG, config.get(TAG_KEY));
+        assertEquals("content_semantic", config.get("field"));
+        assertEquals("{{content}}", config.get("value"));
+    }
+
+    public void testSwapToEnrichMode_multipleFields() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "title", "target_field", "title_semantic")));
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "body", "target_field", "body_semantic")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToEnrichMode(processors);
+
+        assertEquals(2, result.size());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c1 = (Map<String, Object>) result.get(0).get("set");
+        assertEquals("title_semantic", c1.get("field"));
+        assertEquals("{{title}}", c1.get("value"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c2 = (Map<String, Object>) result.get(1).get("set");
+        assertEquals("body_semantic", c2.get("field"));
+        assertEquals("{{body}}", c2.get("value"));
+    }
+
+    public void testSwapToEnrichMode_preservesNonAseProcessors() {
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("lowercase", Map.of("field", "title")));
+        processors.add(proc("rename", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "orig", "target_field", "sem")));
+        processors.add(proc("trim", Map.of("field", "body")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToEnrichMode(processors);
+
+        assertEquals(3, result.size());
+        assertTrue(result.get(0).containsKey("lowercase"));
+        assertTrue(result.get(1).containsKey("set"));
+        assertTrue(result.get(2).containsKey("trim"));
+    }
+
+    public void testSwapToEnrichMode_alreadySetPassesThrough() {
+        // If already in enrich mode (set), should pass through unchanged
+        List<Map<String, Object>> processors = new ArrayList<>();
+        processors.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "sem", "value", "{{orig}}")));
+
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToEnrichMode(processors);
+
+        assertEquals(1, result.size());
+        assertTrue(result.get(0).containsKey("set"));
+    }
+
+    public void testSwapToEnrichMode_emptyInput() {
+        List<Map<String, Object>> result = PipelineMergeUtil.swapToEnrichMode(new ArrayList<>());
+        assertTrue(result.isEmpty());
+    }
+
+    // =========================================================================
+    // Tests for roundtrip: deploy → enrich → deploy
+    // =========================================================================
+
+    public void testRoundtrip_enrichToDeployAndBack() {
+        // Start in enrich mode
+        List<Map<String, Object>> enrichMode = new ArrayList<>();
+        enrichMode.add(proc("lowercase", Map.of("field", "title")));
+        enrichMode.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "content_semantic", "value", "{{content}}")));
+        enrichMode.add(proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "title_semantic", "value", "{{title}}")));
+
+        // Deploy
+        List<Map<String, Object>> deployMode = PipelineMergeUtil.swapToDeployMode(enrichMode);
+        assertEquals(3, deployMode.size());
+        assertTrue(deployMode.get(1).containsKey("rename"));
+        assertTrue(deployMode.get(2).containsKey("rename"));
+
+        // Rollback
+        List<Map<String, Object>> backToEnrich = PipelineMergeUtil.swapToEnrichMode(deployMode);
+        assertEquals(3, backToEnrich.size());
+        assertTrue(backToEnrich.get(0).containsKey("lowercase")); // preserved
+        assertTrue(backToEnrich.get(1).containsKey("set"));
+        assertTrue(backToEnrich.get(2).containsKey("set"));
+
+        // Verify field values are correct after roundtrip
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c1 = (Map<String, Object>) backToEnrich.get(1).get("set");
+        assertEquals("content_semantic", c1.get("field"));
+        assertEquals("{{content}}", c1.get("value"));
+    }
+
+    // =========================================================================
+    // Tests for isAseManaged
+    // =========================================================================
+
+    public void testIsAseManaged_true() {
+        Map<String, Object> proc = proc("set", Map.of(TAG_KEY, ASE_MANAGED_TAG, "field", "x", "value", "y"));
+        assertTrue(PipelineMergeUtil.isAseManaged(proc));
+    }
+
+    public void testIsAseManaged_false_noTag() {
+        Map<String, Object> proc = proc("set", Map.of("field", "x", "value", "y"));
+        assertFalse(PipelineMergeUtil.isAseManaged(proc));
+    }
+
+    public void testIsAseManaged_false_differentTag() {
+        Map<String, Object> proc = proc("set", Map.of(TAG_KEY, "customer_tag", "field", "x", "value", "y"));
+        assertFalse(PipelineMergeUtil.isAseManaged(proc));
+    }
+
+    // =========================================================================
+    // Tests for extractFieldFromMustache
+    // =========================================================================
+
+    public void testExtractFieldFromMustache_simpleField() {
+        assertEquals("content", PipelineMergeUtil.extractFieldFromMustache("{{content}}"));
+    }
+
+    public void testExtractFieldFromMustache_fieldWithSpaces() {
+        assertEquals("content", PipelineMergeUtil.extractFieldFromMustache("{{ content }}"));
+    }
+
+    public void testExtractFieldFromMustache_nestedField() {
+        assertEquals("doc.content", PipelineMergeUtil.extractFieldFromMustache("{{doc.content}}"));
+    }
+
+    public void testExtractFieldFromMustache_null() {
+        assertNull(PipelineMergeUtil.extractFieldFromMustache(null));
+    }
+
+    public void testExtractFieldFromMustache_notTemplate() {
+        assertNull(PipelineMergeUtil.extractFieldFromMustache("plain text"));
+    }
+
+    public void testExtractFieldFromMustache_partialTemplate() {
+        assertNull(PipelineMergeUtil.extractFieldFromMustache("{{incomplete"));
+    }
 }
