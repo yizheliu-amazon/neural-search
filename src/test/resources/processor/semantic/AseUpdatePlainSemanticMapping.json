@@ -1,0 +1,10 @@
+{
+  "mappings": {
+    "properties": {
+      "content_semantic": {
+        "type": "semantic",
+        "model_id": "%s"
+      }
+    }
+  }
+}

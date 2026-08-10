@@ -1,0 +1,16 @@
+{
+  "settings": {
+    "index.final_pipeline": "ase-routing-sim-pipeline-it"
+  },
+  "mappings": {
+    "properties": {
+      "content": {
+        "type": "text"
+      },
+      "content_semantic": {
+        "type": "semantic",
+        "model_id": "%s"
+      }
+    }
+  }
+}
